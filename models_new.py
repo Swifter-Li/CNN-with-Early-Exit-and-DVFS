@@ -9,6 +9,7 @@ PROJECT:        ECE4730J Advanced Embedded System Capstone Project
 """
 
 from nbformat import current_nbformat
+from pytz import country_timezones
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,8 +17,11 @@ import torch.optim as optim
 from torchvision import datasets, transforms
 import utils_new as utils
 from nikolaos.bof_utils import LogisticConvBoF
-from models_new_2 import vgg19_exits_eval_jump_stl10, vgg19_exits_train_jump_stl10, vgg19_exits_eval_jump_mnist, vgg19_exits_train_jump_mnist
-# import utils
+import time
+from models_new_2 import vgg19_exits_eval_jump_stl10, vgg19_exits_train_jump_stl10, vgg19_exits_eval_jump_mnist, vgg19_exits_train_jump_mnist, \
+    vgg19_exits_eval_jump_svhn, vgg19_exits_train_jump_svhn
+from models_new_3 import ResNet_exits_eval, ResNet_exits_train
+
 import global_param as gp
 
 '''
@@ -62,13 +66,15 @@ def get_train_model( args ):
                     return vgg19_exits_train_jump_mnist()
                 elif args.dataset_type == 'stl10':
                     return vgg19_exits_train_jump_stl10()
+                elif args.dataset_type == 'svhn':
+                    return vgg19_exits_train_jump_svhn()
                 else:
                     return vgg19_exits_train_jump()
     elif args.model_name == 'resnet':
-        if args.train_mode == 'normal':
-            return ResNet34_normal(args)
-        elif args.train_mode in ['original', 'exits']:
-            return ResNet34_exits_train(args)
+        if args.dataset_type == 'cifar100':
+            return ResNet_exits_train(100)
+        else: 
+            return ResNet_exits_train(10)
     else:
         print( f'Error: args.model_name ({args.model_name}) is not valid. Should be either cifar or vgg or vgg19' )
         raise NotImplementedError
@@ -93,10 +99,15 @@ def get_eval_model( args ):
                     return vgg19_exits_eval_jump_mnist()
                 elif args.dataset_type == 'stl10':
                     return vgg19_exits_eval_jump_stl10()
+                elif args.dataset_type == 'svhn':
+                    return vgg19_exits_eval_jump_svhn()
                 else:
                     return vgg19_exits_eval_jump()
     elif args.model_name == 'resnet':
-        return ResNet34_exits_eval(args) if args.evaluate_mode == 'exits' else ResNet34_normal(args)
+        if args.dataset_type == 'cifar100':
+            return ResNet_exits_eval(100)
+        else: 
+            return ResNet_exits_eval(10)
     else:
         print( f'Error: args.model_name ({args.model_name}) is not valid. Should be either cifar or vgg or vgg19' )
         raise NotImplementedError
@@ -549,17 +560,29 @@ class vgg19_exits_eval_jump( nn.Module ):
 
         # the parameter for test on determining jump step
 
-        self.statics = [([0] * 16) for i in range(11)]
+        self.statics = [([0] * 20) for i in range(11)]
         self.total = [0] * 11
 
         # the beta coefficient used for accuracy-speed trade-off, the higher the more accurate
         self.beta = 0
         self.target_layer = 6
+        self.start_layer = 6
+        
+        # The index of 3 stands for the computational cost
+        self.count_store = [0]*4
 
-        self.ratio_store = []
+        self.layer_store = [0]*20
         self.jumpstep_store = []
-        self.entropy_store = []
-        self.temp_ratio_list = []
+        self.prediction_store = []
+
+        # The test forward normal to choose 'normal_forward', 'accuracy_forward', 'quant_forward'
+        self.quant = torch.quantization.QuantStub()
+        self.dequant = torch.quantization.DeQuantStub()
+        self.forward_mode = 'normal_forward'
+
+        self.quant_switch = 0
+        # Test on Train parameter
+        self.possible_layer = []
     
     def set_activation_thresholds( self, threshold_list:list ):
         if len( threshold_list ) != self.exit_num:
@@ -567,11 +590,7 @@ class vgg19_exits_eval_jump( nn.Module ):
             raise NotImplementedError
         for i in range(len( threshold_list )):
             self.activation_threshold_list.append(abs( threshold_list[i] ))
-        '''
-        self.activation_threshold_1 = abs( threshold_list[0] )
-        self.activation_threshold_2 = abs( threshold_list[1] )
-        self.activation_threshold_3 = abs( threshold_list[2] )
-        '''
+        
 
     def print_exit_percentage( self ):
         total_inference = sum(self.num_early_exit_list)+ self.original
@@ -598,12 +617,26 @@ class vgg19_exits_eval_jump( nn.Module ):
     def set_beta( self, beta ):
         self.beta = beta
     
+    def set_possible_layer(self, temp):
+        self.possible_layer = temp
+
+    def get_specific_exit_number(self, iterate):
+        return self.num_early_exit_list[iterate]
+    
     def _calculate_max_activation( self, param ):
         '''
         return the maximum activation item in [param]
         '''
-        return torch.max( torch.abs( torch.max( param ) ), torch.abs( torch.min( param ) ) )
+        return torch.max( torch.abs( torch.max( param ) ), torch.abs( torch.min( param ) ) )    
 
+    def simple_conv1d(self, param):
+        copy = param.copy()
+        temp = []
+        copy.insert(0,0)
+        copy.append(0)
+        for i in range(len(copy)-2):
+            temp.append(copy[i]+copy[i+1]+copy[i+2])
+        return temp
     
     def _calculate_cross_entropy(self, param):
 
@@ -623,102 +656,353 @@ class vgg19_exits_eval_jump( nn.Module ):
                 a += -A[0][i]*torch.log2(A[0][i])
 
         return a 
-    '''
-    def _calculate_cross_entropy(self, param):
-        A = F.softmax(param, dim = 1)
-        a = -((A * torch.log2(A)).sum())
-        return a
-    '''
-
-    def output( self ):
-        return self.ratio_store, self.jumpstep_store, self.entropy_store, self.temp_ratio_list
-      #  return self.ratio_store, self.jumpstep_store
+        
+    def prediction(self, param, layer):
+        round = 8 
+        temp = []
+        for i in range(data_type):
+            temp.append(param[0][i].item())
+        for i in range(round):
+            temp = self.simple_conv1d(temp)
+            length = len(self.activation_threshold_list)
+            temp_thresold = self.activation_threshold_list[layer+i] if (layer+i) < length else self.activation_threshold_list[length-1]
+            if max(abs(max(temp)), abs(min(temp))) > self.beta * temp_thresold:
+                return i+1
+        return round
     
-    def forward( self, x ):
+    def output( self ):
+        return (self.count_store, self.layer_store) , self.jumpstep_store, self.prediction_store
+        
+    def settings( self, layer, forward_mode, p = 0 ):
+        self.target_layer = layer
+        self.start_layer = layer
+        self.forward_mode = forward_mode
+        self.quant_switch = p
+        self.count_store = []
+
+    def forward( self, x):
+        if self.forward_mode == 'accuracy_forward':
+            return self.accuracy_forward(x)
+        elif self.forward_mode == 'quant_forward':
+            return self.quant_forward(x)
+        elif self.forward_mode == 'normal_forward_3exits':
+            return self.normal_forward_3exits(x)      
+        elif self.forward_mode == 'normal_forward_noexits':
+            return self.normal_forward_noexits(x)
+        elif self.forward_mode == 'test_on_train_forward':
+            return self.test_on_train_forward(x)
+        elif self.forward_mode == 'test_on_train_normal_forward':
+            return self.test_on_train_normal_forward(x)       
+        else:
+            return self.normal_forward(x)    
+    
+    def accuracy_forward( self, x ):
+        
         flag = 0
-        temp_ratio = 0
-        temp_entropy = 0
-        temp_exit_layer = 0
+        if self.quant_switch == 1:
+            x = self.quant(x)
         x = F.relu(self.bn1(self.conv1(x)))
+        current_layer = 1
+        if self.target_layer == 1:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / self.beta * self.activation_threshold_list[0]
+            if ratio >= 1:
+                self.num_early_exit_list[0] += 1
+                return 0, exit1
+            self.count_store.append(ratio.item())
+            self.prediction_store.append(self.prediction(exit1, current_layer))
+        
+
         x = F.relu(self.bn2(self.conv2(x)))
+        current_layer = 2
+        if self.target_layer == 2:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[1])
+            flag = int(ratio/0.1)
+            if ratio >= 1:
+                self.num_early_exit_list[1] += 1
+                return 1, exit1
+            self.count_store.append(ratio.item())
+         #  self.prediction_store.append(1)
+            self.prediction_store.append(self.prediction(exit1, current_layer))
+            self.total[flag] = self.total[flag] + 1
+        elif self.target_layer <= current_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)       
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[1])
+            if ratio >= 1:
+                self.jumpstep_store.append(current_layer-self.target_layer)
+                self.num_early_exit_list[1] += 1
+                self.statics[flag][current_layer-self.target_layer] = self.statics[flag][current_layer-self.target_layer] + 1
+                return 1, exit1       
+
+
         x = F.max_pool2d(x, 2, 2)
+        current_layer = 3
+        if self.target_layer == 3:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[2])
+            flag = int(ratio/0.1)
+            if ratio >= 1:
+                self.num_early_exit_list[2] += 1
+                return 2, exit1
+            self.count_store.append(ratio.item())
+            self.prediction_store.append(self.prediction(exit1, current_layer))
+            self.total[flag] = self.total[flag] + 1
+        elif self.target_layer <= current_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
+            exit1 = self.exit_1_fc(x_exit_1)        
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[2])
+            if ratio >= 1:
+                self.jumpstep_store.append(current_layer-self.target_layer)
+                self.num_early_exit_list[2] += 1
+                self.statics[flag][current_layer-self.target_layer] = self.statics[flag][current_layer-self.target_layer] + 1
+                return 2, exit1          
+        
+
         x = F.relu(self.bn3(self.conv3(x)))
+        current_layer = 4
+        if self.target_layer == 4:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[3])
+            flag = int(ratio/0.1)
+            if ratio >= 1:
+                self.num_early_exit_list[3] += 1
+                return 3, exit1
+            self.count_store.append(ratio.item())
+            self.prediction_store.append(self.prediction(exit1, current_layer))
+            self.total[flag] = self.total[flag] + 1
+        elif self.target_layer <= current_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)          
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[3])
+            if ratio >= 1:
+                self.jumpstep_store.append(current_layer-self.target_layer)
+                self.num_early_exit_list[3] += 1
+                self.statics[flag][current_layer-self.target_layer] = self.statics[flag][current_layer-self.target_layer] + 1
+                return 3, exit1           
+        
+
         x = F.relu(self.bn4(self.conv4(x)))
-     
+        current_layer = 5
+        if self.target_layer == 5:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[4])
+            flag = int(ratio/0.1)
+            if ratio >= 1:
+                self.num_early_exit_list[4] += 1
+                return 4, exit1
+            self.count_store.append(ratio.item())
+            self.prediction_store.append(self.prediction(exit1, current_layer))
+            self.total[flag] = self.total[flag] + 1
+        elif self.target_layer <= current_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)          
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[4])
+            if ratio >= 1:
+                self.jumpstep_store.append(current_layer-self.target_layer)
+                self.num_early_exit_list[4] += 1
+                self.statics[flag][current_layer-self.target_layer] = self.statics[flag][current_layer-self.target_layer] + 1
+                return 4, exit1        
+        
 
         x = F.max_pool2d(x, 2, 2)
         current_layer = 6
         if self.target_layer == 6:
-            x_exit_1 = self.exit_1(x)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
             exit1 = self.exit_1_fc(x_exit_1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[5])
-            temp_ratio = ratio
-            temp_exit_layer = exit1
             flag = int(ratio/0.1)
             if ratio >= 1:
-              #  self.jumpstep_store.append(current_layer-self.target_layer)
                 self.num_early_exit_list[5] += 1
-              #  self.statics[flag][current_layer-self.target_layer] = self.statics[flag][current_layer-self.target_layer] + 1
                 return 5, exit1
-            self.ratio_store.append(ratio.item())
-            self.entropy_store.append(self._calculate_cross_entropy(exit1).item())
-            temp_entropy = self._calculate_cross_entropy(exit1).item()
+            self.count_store.append(self._calculate_cross_entropy(exit1).item())
+            self.prediction_store.append(self.prediction(exit1, current_layer))
             self.total[flag] = self.total[flag] + 1
+        elif self.target_layer <= current_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[5])            
+            if ratio >= 1:
+                self.jumpstep_store.append(current_layer-self.target_layer)
+                self.num_early_exit_list[5] += 1
+                self.statics[flag][current_layer-self.target_layer] = self.statics[flag][current_layer-self.target_layer] + 1
+                return 5, exit1
 
         x = F.relu(self.bn5(self.conv5(x)))
         current_layer = 7
-        x_exit_1 = self.exit_2(x)
-        x_exit_1 = self.exit_0_fc(x_exit_1)
-        exit1 = self.exit_1_fc(x_exit_1)
-        ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[6])
-        if ratio >= 1:
-            if temp_entropy > 2.8 and temp_entropy < 3.2:
-                self.temp_ratio_list.append(temp_ratio)
-            self.jumpstep_store.append(current_layer-self.target_layer)
-            self.statics[flag][current_layer-self.target_layer]= self.statics[flag][current_layer-self.target_layer] + 1
-            self.num_early_exit_list[6] += 1
-            return 6, exit1
+        if self.target_layer == 7:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[6])
+            flag = int(ratio/0.1)
+            if ratio >= 1:
+                self.num_early_exit_list[6] += 1
+                return 6, exit1
+            self.count_store.append(ratio.item())
+            self.prediction_store.append(self.prediction(exit1, current_layer))
+            self.total[flag] = self.total[flag] + 1
+        elif self.target_layer <= current_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[6])
+            if ratio >= 1:
+                self.jumpstep_store.append(current_layer-self.target_layer)
+                self.statics[flag][current_layer-self.target_layer]= self.statics[flag][current_layer-self.target_layer] + 1
+                self.num_early_exit_list[6] += 1
+                return 6, exit1
+
 
         x = F.relu(self.bn6(self.conv6(x)))
         current_layer = 8
-        x_exit_1 = self.exit_2(x)
-        x_exit_1 = self.exit_0_fc(x_exit_1)
-        exit1 = self.exit_1_fc(x_exit_1)
-        ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[7])
-        if ratio >= 1:
-            self.jumpstep_store.append(current_layer-self.target_layer)
-            self.statics[flag][current_layer-self.target_layer]= self.statics[flag][current_layer-self.target_layer] + 1
-            self.num_early_exit_list[7] += 1
-            return 7, exit1
+        if self.target_layer == 8:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[7])
+            flag = int(ratio/0.1)
+            if ratio >= 1:
+                self.num_early_exit_list[7] += 1
+                return 7, exit1
+            self.count_store.append(ratio.item())
+            self.prediction_store.append(self.prediction(exit1, current_layer))
+            self.total[flag] = self.total[flag] + 1
+        elif self.target_layer <= current_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[7])
+            if ratio >= 1:
+                self.jumpstep_store.append(current_layer-self.target_layer)
+                self.statics[flag][current_layer-self.target_layer]= self.statics[flag][current_layer-self.target_layer] + 1
+                self.num_early_exit_list[7] += 1
+                return 7, exit1        
+
 
         x = F.relu(self.bn7(self.conv7(x)))
-        current_layer += 1
-        x_exit_1 = self.exit_2(x)
-        x_exit_1 = self.exit_0_fc(x_exit_1)
-        exit1 = self.exit_1_fc(x_exit_1)
-        ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[8])
-        if ratio >= 1:
-            self.jumpstep_store.append(current_layer-self.target_layer)
-            self.statics[flag][current_layer-self.target_layer]+= 1
-            self.num_early_exit_list[8] += 1
-            return 8, exit1
+        current_layer = 9
+        if self.target_layer == 9:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[8])
+            if ratio >= 1:
+                self.num_early_exit_list[8] += 1
+                return 8, exit1    
+            self.prediction_store.append(self.prediction(exit1, current_layer))
+            self.total[flag] = self.total[flag] + 1            
+        elif self.target_layer <= current_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[8])
+            if ratio >= 1:
+                self.jumpstep_store.append(current_layer-self.target_layer)
+                self.statics[flag][current_layer-self.target_layer]+= 1
+                self.num_early_exit_list[8] += 1
+                return 8, exit1
    
         
         x = F.relu(self.bn8(self.conv8(x)))
-        current_layer += 1
-        x_exit_1 = self.exit_2(x)
-        x_exit_1 = self.exit_0_fc(x_exit_1)
-        exit1 = self.exit_1_fc(x_exit_1)
-        ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[9])
-        if ratio >= 1:
-            self.jumpstep_store.append(current_layer-self.target_layer)
-            self.statics[flag][current_layer-self.target_layer]+= 1
-            self.num_early_exit_list[9] += 1
-            return 9, exit1
+        current_layer = 10
+        if self.target_layer == 10:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[9])
+            if ratio >= 1:
+                self.num_early_exit_list[9] += 1
+                return 9, exit1
+            self.prediction_store.append(self.prediction(exit1, current_layer))
+            self.total[flag] = self.total[flag] + 1                                 
+        elif self.target_layer <= current_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[9])
+            if ratio >= 1:
+                self.jumpstep_store.append(current_layer-self.target_layer)
+                self.statics[flag][current_layer-self.target_layer]+= 1
+                self.num_early_exit_list[9] += 1
+                return 9, exit1
        
         x = F.max_pool2d(x, 2, 2)
         current_layer += 1
-        x_exit_1 = self.exit_2(x)
+        if self.quant_switch == 1:
+            x_exit_1 =  self.exit_2(self.dequant(x))
+        else:
+            x_exit_1 = self.exit_2(x)
         exit1 = self.exit_1_fc(x_exit_1)
         ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[10])
         if ratio >= 1:
@@ -730,7 +1014,10 @@ class vgg19_exits_eval_jump( nn.Module ):
         
         x = F.relu(self.bn9(self.conv9(x)))
         current_layer += 1
-        x_exit_1 = self.exit_3(x)
+        if self.quant_switch == 1:
+            x_exit_1 =  self.exit_3(self.dequant(x))
+        else:
+            x_exit_1 = self.exit_3(x)
         x_exit_1 = self.exit_0_fc(x_exit_1)
         exit1 = self.exit_1_fc(x_exit_1)
         ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[11])
@@ -743,7 +1030,10 @@ class vgg19_exits_eval_jump( nn.Module ):
 
         x = F.relu(self.bn10(self.conv10(x)))
         current_layer += 1
-        x_exit_1 = self.exit_3(x)
+        if self.quant_switch == 1:
+            x_exit_1 =  self.exit_3(self.dequant(x))
+        else:
+            x_exit_1 = self.exit_3(x)
         x_exit_1 = self.exit_0_fc(x_exit_1)
         exit1 = self.exit_1_fc(x_exit_1)
         ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[12])
@@ -756,7 +1046,10 @@ class vgg19_exits_eval_jump( nn.Module ):
              
         x = F.relu(self.bn11(self.conv11(x)))
         current_layer += 1
-        x_exit_1 = self.exit_3(x)
+        if self.quant_switch == 1:
+            x_exit_1 =  self.exit_3(self.dequant(x))
+        else:
+            x_exit_1 = self.exit_3(x)
         x_exit_1 = self.exit_0_fc(x_exit_1)
         exit1 = self.exit_1_fc(x_exit_1)
         ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[13])
@@ -769,7 +1062,10 @@ class vgg19_exits_eval_jump( nn.Module ):
 
         x = F.relu(self.bn12(self.conv12(x)))
         current_layer += 1
-        x_exit_1 = self.exit_3(x)
+        if self.quant_switch == 1:
+            x_exit_1 =  self.exit_3(self.dequant(x))
+        else:
+            x_exit_1 = self.exit_3(x)
         x_exit_1 = self.exit_0_fc(x_exit_1)
         exit1 = self.exit_1_fc(x_exit_1)
         ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[14])
@@ -782,7 +1078,10 @@ class vgg19_exits_eval_jump( nn.Module ):
 
         x = F.max_pool2d(x, 2, 2)
         current_layer += 1
-        x_exit_1 = self.exit_3(x)
+        if self.quant_switch == 1:
+            x_exit_1 =  self.exit_3(self.dequant(x))
+        else:
+            x_exit_1 = self.exit_3(x)
         exit1 = self.exit_1_fc(x_exit_1)
         ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[15])
         if ratio >= 1:
@@ -794,8 +1093,10 @@ class vgg19_exits_eval_jump( nn.Module ):
 
         x = F.relu(self.bn13(self.conv13(x)))
         current_layer += 1
-        x_exit_1 = self.exit_3(x)
-         #   x_exit_1 = self.exit_0_fc(x_exit_1)
+        if self.quant_switch == 1:
+            x_exit_1 =  self.exit_3(self.dequant(x))
+        else:
+            x_exit_1 = self.exit_3(x)
         exit1 = self.exit_1_fc(x_exit_1)
         ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[16])
         if ratio >= 1:
@@ -806,8 +1107,10 @@ class vgg19_exits_eval_jump( nn.Module ):
 
         x = F.relu(self.bn14(self.conv14(x)))
         current_layer += 1
-        x_exit_1 = self.exit_3(x)
-         #   x_exit_1 = self.exit_0_fc(x_exit_1)
+        if self.quant_switch == 1:
+            x_exit_1 =  self.exit_3(self.dequant(x))
+        else:
+            x_exit_1 = self.exit_3(x)
         exit1 = self.exit_1_fc(x_exit_1)
         ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[17])
         if ratio >= 1:
@@ -819,8 +1122,10 @@ class vgg19_exits_eval_jump( nn.Module ):
 
         x = F.relu(self.bn15(self.conv15(x)))
         current_layer += 1
-        x_exit_1 = self.exit_3(x)
-       #     x_exit_1 = self.exit_0_fc(x_exit_1)
+        if self.quant_switch == 1:
+            x_exit_1 =  self.exit_3(self.dequant(x))
+        else:
+            x_exit_1 = self.exit_3(x)
         exit1 = self.exit_1_fc(x_exit_1)
         ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[18])
         if ratio >= 1:
@@ -832,8 +1137,10 @@ class vgg19_exits_eval_jump( nn.Module ):
         
         x = F.relu(self.bn16(self.conv16(x)))
         current_layer += 1
-        x_exit_1 = self.exit_3(x)
-       #     x_exit_1 = self.exit_0_fc(x_exit_1)
+        if self.quant_switch == 1:
+            x_exit_1 =  self.exit_3(self.dequant(x))
+        else:
+            x_exit_1 = self.exit_3(x)
         exit1 = self.exit_1_fc(x_exit_1)
         ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[19])
         if ratio >= 1:
@@ -846,372 +1153,1977 @@ class vgg19_exits_eval_jump( nn.Module ):
         x = F.avg_pool2d(x, 1)
         x = x.view(-1, 512)
         x = self.fc(x)
+        if self.quant_switch == 1:
+            x = self.dequant(x)
         self.original += 1
         current_layer += 1
         self.jumpstep_store.append(current_layer-self.target_layer)
         self.statics[flag][current_layer-self.target_layer]+= 1
         return 20, x
-    '''
-    def forward( self, x ):
-        x = F.relu(self.bn1(self.conv1(x)))
+    
+
+    def normal_forward( self, x ):
+        self.target_layer = self.start_layer
+        count = 0
+        time2 = 0
+        time1 = time.perf_counter()
+        layer_st = 0
+        layer_end = 0
+        
+        if self.quant_switch == 1:
+            x = self.quant(x)
+        x = F.relu(self.bn1(self.conv1(x))) #3*32*64*32
+        self.count_store[3] += 3*32*64*32
+        current_layer = 1
         if self.target_layer == 1:
-            x_exit_1 = self.exit_0(x)
-            x_exit_1 = self.exit_0_fc(x_exit_1)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256*127
+            exit1 = self.exit_1_fc(x_exit_1) #64*19
             ratio = self._calculate_max_activation( exit1 ) / self.beta * self.activation_threshold_list[0]
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 32*64*64*32 + 256*127 + 64*19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer     
             if ratio >= 1:
                 self.num_early_exit_list[0] += 1
                 return 0, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
             else:
-                self.target_layer+=Jump_step[2] 
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                count += 1
+
+        x = F.relu(self.bn2(self.conv2(x))) #32*32*64*64
+        self.count_store[3] += 32*32*64*64
+        current_layer = 2
+        if self.target_layer == 2:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[1])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 32*64*64*32 + 256*127 + 64*19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[1] += 1
+                return 1, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                count+=1
+            
+        x = F.max_pool2d(x, 2, 2) #32*32*64*64
+        self.count_store[3] += 32*32*64*64
+        current_layer = 3
+        if self.target_layer == 3:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[2])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 32*64*64*32 + 64*19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[2] += 1
+                return 2, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                count+=1                
+
+        x = F.relu(self.bn3(self.conv3(x))) #16*16*128*128
+        self.count_store[3] += 16*128*16*128
+        current_layer = 4
+        if self.target_layer == 4:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[3])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 16*16*128*64 + 127*64+ 64*19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[3] += 1
+                return 3, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                count+=1
+            
+        x = F.relu(self.bn4(self.conv4(x))) #16*16*128*128
+        self.count_store[3] += 16*16*128*128
+        current_layer = 5
+        if self.target_layer == 5:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[4])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 16*16*128*64 + 127*64+ 64*19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer                
+            if ratio >= 1:
+                self.num_early_exit_list[4] += 1
+                return 4, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                count+=1
+
+        x = F.max_pool2d(x, 2, 2) #16*16*128*128
+        self.count_store[3] += 16*16*128*128
+        current_layer = 6
+        if self.target_layer == 6:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * 19
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[5])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] +=  8*8*128*64 + 64 * 19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[5] += 1
+                return 5, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                count+=1
+
+        x = F.relu(self.bn5(self.conv5(x))) # 8*8*128*256
+        self.count_store[3] += 8*8*128*256
+        current_layer = 7
+        if self.target_layer == 7:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64*19
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[6])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 8*8*256*64 + 256 * (2*64-1) + 64*19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[6] += 1
+                return 6, exit1
+            else:
+               self.target_layer +=  self.prediction(exit1, current_layer)
+               count+=1
+
+        x = F.relu(self.bn6(self.conv6(x))) # 8*8*256*256
+        self.count_store[3] += 8*8*256*256
+        current_layer = 8
+        if self.target_layer == 8:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64*19
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[7])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] +=8*8*256*64 + 256 * (2*64-1) + 64*19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[7] += 1
+                return 7, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                count+=1
+
+        x = F.relu(self.bn7(self.conv7(x))) # 8*8*256*256
+        self.count_store[3] += 8*8*256*256
+        current_layer = 9
+        if self.target_layer == 9:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[8])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 8*8*256*64 + 256 * (2*64-1) + 64*19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[8] += 1
+                return 8, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                count+=1
+        
+        x = F.relu(self.bn8(self.conv8(x))) # 8*8*256*256
+        self.count_store[3] += 8*8*256*256
+        current_layer = 10
+        if self.target_layer == 10:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)# 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[9])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 8*8*256*64 + 256 * (2*64-1) + 64*19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[9] += 1
+                return 9, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                count+=1
+
+        x = F.max_pool2d(x, 2, 2) # 4*4*256*256
+        self.count_store[3] += 4*4*256*256
+        current_layer = 11
+        if self.target_layer == 11:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[10])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 4*4*256*64 + 64 * 19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[10] += 1
+                return 10, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                count+=1 
+        
+        x = F.relu(self.bn9(self.conv9(x))) # 256*512*4*4
+        self.count_store[3] += 256*512*4*4
+        current_layer = 12
+        if self.target_layer == 12:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[11])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 4*4*512*64 + 512 * (2*64-1) + 64 * 19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[11] += 1
+                return 11, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+                count+=1 
+
+        x = F.relu(self.bn10(self.conv10(x))) #512*512*4*4
+        self.count_store[3] += 512*512*4*4
+        current_layer = 13
+        if self.target_layer == 13:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[12])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 512 * (2*64-1) + 64 * 19 + 4*4*512*64
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[12] += 1
+                return 12, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+                count+=1
+             
+        x = F.relu(self.bn11(self.conv11(x))) #512*512*4*4
+        self.count_store[3] += 512*512*4*4
+        current_layer = 14
+        if self.target_layer == 14:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[13])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 512 * (2*64-1) + 64 * 19 + 4*4*512*64
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[13] += 1
+                return 13, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+                count+=1
+
+        x = F.relu(self.bn12(self.conv12(x))) #512*512*4*4
+        self.count_store[3] += 512*512*4*4
+        current_layer = 15
+        if self.target_layer == 15:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[14])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 512 * (2*64-1) + 64 * 19 + 4*4*512*64
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[14] += 1
+                return 14, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+                count+=1
+
+        x = F.max_pool2d(x, 2, 2) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        current_layer = 16
+        if self.target_layer == 16:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[15])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 2*2*512*64 + 64 * 19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[15] += 1
+                return 15, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+                count+=1
+
+        x = F.relu(self.bn13(self.conv13(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        current_layer = 17
+        if self.target_layer == 17:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[16])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 2*2*512*64 + 64 * 19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[16] += 1
+                return 16, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+                count+=1
+
+        x = F.relu(self.bn14(self.conv14(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        current_layer = 18
+        if self.target_layer == 18:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[17])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 2*2*512*64 + 64 * 19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[17] += 1
+                return 17, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+                count+=1
+
+        x = F.relu(self.bn15(self.conv15(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        current_layer = 19
+        if self.target_layer == 19:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[18])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 2*2*512*64 + 64 * 19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[18] += 1
+                return 18, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+                count+=1
+        
+        x = F.relu(self.bn16(self.conv16(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        current_layer = 20
+        if self.target_layer == 20:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[19])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 2*2*512*64 + 64 * 19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            elif count == 1:
+                self.count_store[1] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            else:
+                self.count_store[2] += time2 - time1
+                self.layer_store[layer_end - layer_st] += 1
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[19] += 1
+                return 19, exit1
+    
+        current_layer+=1
+        x = F.max_pool2d(x, 2, 2)
+        x = F.avg_pool2d(x, 1)
+        x = x.reshape(-1, 512)
+        x = self.fc(x)
+        if self.quant_switch == 1:
+            x = self.dequant(x)
+        #count += 512*512*2*2*4 + 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1) + 512*512*4*4*4 + 4*4*256*256 + 4*4*256*64 + 64 * (2*10-1) + 8*8*256*256*4 + 8*8*128*64 + 64 * 19
+        time2 = time.perf_counter()  #Time Sign
+        layer_end = current_layer
+        if count == 0:           
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+        elif count == 1:
+            self.count_store[1] += time2 - time1
+            self.layer_store[layer_end - layer_st] += 1
+        else:
+            self.count_store[2] += time2 - time1
+            self.layer_store[layer_end - layer_st] += 1
+        time1 = time.perf_counter()
+        layer_st = current_layer    
+        self.original += 1
+        return 20, x
+
+
+    def normal_forward_3exits( self, x ):
+        self.target_layer = self.start_layer
+        time2 = 0
+        time1 = time.perf_counter()
+
+        x = F.relu(self.bn1(self.conv1(x))) #3*32*64*32
+        self.count_store[3] += 3*32*64*32
+        x = F.relu(self.bn2(self.conv2(x))) #32*32*64*64
+        self.count_store[3] += 32*32*64*64
+        x = F.max_pool2d(x, 2, 2) #32*32*64*64
+        x = F.relu(self.bn3(self.conv3(x))) #16*16*128*128
+        self.count_store[3] += 16*128*16*128
+        x = F.relu(self.bn4(self.conv4(x))) #16*16*128*128
+        self.count_store[3] += 16*16*128*128
+        x = F.max_pool2d(x, 2, 2) #16*16*128*128
+    
+        self.count_store[3] += 16*16*128*128
+        x_exit_1 = self.exit_1(x) #8*8*128*64
+        exit1 = self.exit_1_fc(x_exit_1) # 64 * 19
+        ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[5])
+        self.count_store[3] +=  8*8*128*64 + 64 * 19
+        self.layer_store[0] += 6
+        if ratio >= 1:
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[0] += time2 - time1 
+            self.num_early_exit_list[5] += 1
+            return 5, exit1
+    
+        x = F.relu(self.bn5(self.conv5(x))) # 8*8*128*256
+        self.count_store[3] += 8*8*128*256
+        x = F.relu(self.bn6(self.conv6(x))) # 8*8*256*256
+        self.count_store[3] += 8*8*256*256
+        x = F.relu(self.bn7(self.conv7(x))) # 8*8*256*256
+        self.count_store[3] += 8*8*256*256
+        x = F.relu(self.bn8(self.conv8(x))) # 8*8*256*256
+        self.count_store[3] += 8*8*256*256
+        x = F.max_pool2d(x, 2, 2) # 4*4*256*256
+        self.count_store[3] += 4*4*256*256
+        x_exit_1 = self.exit_2(x) # 4*4*256*64 
+        exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+        ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[10])
+        self.count_store[3] += 4*4*256*64 + 64 * 19
+        self.layer_store[0] += 5
+        if ratio >= 1:
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[0] += time2 - time1 
+            self.num_early_exit_list[10] += 1
+            return 10, exit1
+
+        x = F.relu(self.bn9(self.conv9(x))) # 256*512*4*4
+        self.count_store[3] += 256*512*4*4
+        x = F.relu(self.bn10(self.conv10(x))) #512*512*4*4
+        self.count_store[3] += 512*512*4*4
+        x = F.relu(self.bn11(self.conv11(x))) #512*512*4*4
+        self.count_store[3] += 512*512*4*4
+        x = F.relu(self.bn12(self.conv12(x))) #512*512*4*4
+        self.count_store[3] += 512*512*4*4
+        x = F.max_pool2d(x, 2, 2) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        x_exit_1 = self.exit_3(x) # 2*2*512*64
+        exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+        ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[15])
+        self.count_store[3] += 2*2*512*64 + 64 * 19
+        self.layer_store[0] += 5
+        if ratio >= 1:
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[0] += time2 - time1 
+            self.num_early_exit_list[15] += 1
+            return 15, exit1
+
+
+        x = F.relu(self.bn13(self.conv13(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        x = F.relu(self.bn14(self.conv14(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        x = F.relu(self.bn15(self.conv15(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        x = F.relu(self.bn16(self.conv16(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        x = F.max_pool2d(x, 2, 2)
+        x = F.avg_pool2d(x, 1)
+        x = x.view(-1, 512)
+        x = self.fc(x)
+        #count += 512*512*2*2*4 + 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1) + 512*512*4*4*4 + 4*4*256*256 + 4*4*256*64 + 64 * (2*10-1) + 8*8*256*256*4 + 8*8*128*64 + 64 * 19
+        time2 = time.perf_counter()  #Time Sign
+        self.count_store[0] += time2 -  time1
+        self.layer_store[0] += 4
+        self.original += 1
+        return 20, x
+
+
+    def normal_forward_noexits( self, x ):
+        time1 = time.perf_counter()
+        x = self.quant(x)
+        x = F.relu(self.bn1(self.conv1(x))) #3*32*64*32
+        self.count_store[3] += 3*32*64*32
+        x = F.relu(self.bn2(self.conv2(x))) #32*32*64*64
+        self.count_store[3] += 32*32*64*64
+        x = F.max_pool2d(x, 2, 2) #32*32*64*64
+        x = F.relu(self.bn3(self.conv3(x))) #16*16*128*128
+        self.count_store[3] += 16*128*16*128
+        x = F.relu(self.bn4(self.conv4(x))) #16*16*128*128
+        self.count_store[3] += 16*16*128*128
+        x = F.max_pool2d(x, 2, 2) #16*16*128*128
+        self.count_store[3] += 16*16*128*128  
+        x = F.relu(self.bn5(self.conv5(x))) # 8*8*128*256
+        self.count_store[3] += 8*8*128*256
+        x = F.relu(self.bn6(self.conv6(x))) # 8*8*256*256
+        self.count_store[3] += 8*8*256*256
+        x = F.relu(self.bn7(self.conv7(x))) # 8*8*256*256
+        self.count_store[3] += 8*8*256*256
+        x = F.relu(self.bn8(self.conv8(x))) # 8*8*256*256
+        self.count_store[3] += 8*8*256*256
+        x = F.max_pool2d(x, 2, 2) # 4*4*256*256
+        self.count_store[3] += 4*4*256*256
+        x = F.relu(self.bn9(self.conv9(x))) # 256*512*4*4
+        self.count_store[3] += 256*512*4*4
+        x = F.relu(self.bn10(self.conv10(x))) #512*512*4*4
+        self.count_store[3] += 512*512*4*4
+        x = F.relu(self.bn11(self.conv11(x))) #512*512*4*4
+        self.count_store[3] += 512*512*4*4
+        x = F.relu(self.bn12(self.conv12(x))) #512*512*4*4
+        self.count_store[3] += 512*512*4*4
+        x = F.max_pool2d(x, 2, 2) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        x = F.relu(self.bn13(self.conv13(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        x = F.relu(self.bn14(self.conv14(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        x = F.relu(self.bn15(self.conv15(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        x = F.relu(self.bn16(self.conv16(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        x = F.max_pool2d(x, 2, 2)
+        x = F.avg_pool2d(x, 1)
+        x = x.reshape(-1, 512)
+        x = self.fc(x)
+        x = self.dequant(x)
+        #count += 512*512*2*2*4 + 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1) + 512*512*4*4*4 + 4*4*256*256 + 4*4*256*64 + 64 * (2*10-1) + 8*8*256*256*4 + 8*8*128*64 + 64 * 19
+        time2 = time.perf_counter()  #Time Sign
+        self.count_store[0] += time2 -  time1
+        self.layer_store[0] += 19
+        self.original += 1
+        return 20, x
+
+
+    def test_on_train_forward( self, x ):
+        self.target_layer = self.start_layer
+        if self.quant_switch == 1:
+            x = self.quant(x)
+        x = F.relu(self.bn1(self.conv1(x)))
+        current_layer = 1
+        if self.target_layer == 1:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / self.beta * self.activation_threshold_list[0]     
+            if ratio >= 1:
+                self.num_early_exit_list[0] += 1
+                return 0, exit1
 
         x = F.relu(self.bn2(self.conv2(x)))
+        current_layer = 2
         if self.target_layer == 2:
-            x_exit_1 = self.exit_0(x)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
             x_exit_1 = self.exit_0_fc(x_exit_1)
             exit1 = self.exit_1_fc(x_exit_1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[1])
             if ratio >= 1:
                 self.num_early_exit_list[1] += 1
                 return 1, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-            else:
-                self.target_layer+=Jump_step[2]
+
             
         x = F.max_pool2d(x, 2, 2)
+        current_layer = 3
         if self.target_layer == 3:
-            x_exit_1 = self.exit_0(x)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
             exit1 = self.exit_1_fc(x_exit_1)
-            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[2])
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[2])  
             if ratio >= 1:
                 self.num_early_exit_list[2] += 1
                 return 2, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-            else:
-                self.target_layer+=Jump_step[2] 
 
         x = F.relu(self.bn3(self.conv3(x)))
+        current_layer = 4
         if self.target_layer == 4:
-            x_exit_1 = self.exit_1(x)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
             x_exit_1 = self.exit_0_fc(x_exit_1)
             exit1 = self.exit_1_fc(x_exit_1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[3])
             if ratio >= 1:
                 self.num_early_exit_list[3] += 1
                 return 3, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-            else:
-                self.target_layer+=Jump_step[2] 
             
         x = F.relu(self.bn4(self.conv4(x)))
+        current_layer = 5
         if self.target_layer == 5:
-            x_exit_1 = self.exit_1(x)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
             x_exit_1 = self.exit_0_fc(x_exit_1)
             exit1 = self.exit_1_fc(x_exit_1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[4])
             if ratio >= 1:
                 self.num_early_exit_list[4] += 1
                 return 4, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-            else:
-                self.target_layer+=Jump_step[2] 
 
         x = F.max_pool2d(x, 2, 2)
+        current_layer = 6
         if self.target_layer == 6:
-            x_exit_1 = self.exit_1(x)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * 19
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[5])
+            #count += 8*8*128*64 + 64 * 19
             if ratio >= 1:
                 self.num_early_exit_list[5] += 1
                 return 5, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-            else:
-                self.target_layer+=Jump_step[2] 
 
-        x = F.relu(self.bn5(self.conv5(x)))
+        x = F.relu(self.bn5(self.conv5(x))) # 8*8*128*256
+        current_layer = 7
         if self.target_layer == 7:
-            x_exit_1 = self.exit_2(x)
-            x_exit_1 = self.exit_0_fc(x_exit_1)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64*19
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[6])
+            #count += 8*8*128*256 + 8*8*256*64 + 256 * (2*64-1) + 64*19
             if ratio >= 1:
                 self.num_early_exit_list[6] += 1
                 return 6, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-            else:
-                self.target_layer+=Jump_step[2] 
-
-        x = F.relu(self.bn6(self.conv6(x)))
+               
+        x = F.relu(self.bn6(self.conv6(x))) # 8*8*256*256
+        current_layer = 8
         if self.target_layer == 8:
-            x_exit_1 = self.exit_2(x)
-            x_exit_1 = self.exit_0_fc(x_exit_1)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64*19
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[7])
+            #count += 8*8*256*256 + 8*8*256*64 + 256 * (2*64-1) + 64*19
             if ratio >= 1:
                 self.num_early_exit_list[7] += 1
                 return 7, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-            else:
-                self.target_layer+=Jump_step[2] 
 
-        x = F.relu(self.bn7(self.conv7(x)))
+        x = F.relu(self.bn7(self.conv7(x))) # 8*8*256*256
+        current_layer = 9
         if self.target_layer == 9:
-            x_exit_1 = self.exit_2(x)
-            x_exit_1 = self.exit_0_fc(x_exit_1)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[8])
+            #count +=  8*8*256*256 + 8*8*256*64 + 256 * (2*64-1) + 64*19
             if ratio >= 1:
                 self.num_early_exit_list[8] += 1
                 return 8, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-            else:
-                self.target_layer+=Jump_step[2] 
         
-        x = F.relu(self.bn8(self.conv8(x)))
+        x = F.relu(self.bn8(self.conv8(x))) # 8*8*256*256
+        current_layer = 10
         if self.target_layer == 10:
-            x_exit_1 = self.exit_2(x)
-            x_exit_1 = self.exit_0_fc(x_exit_1)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)# 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[9])
+            #count += 8*8*256*256 + 8*8*256*64 + 256 * (2*64-1) + 64*19  
             if ratio >= 1:
                 self.num_early_exit_list[9] += 1
                 return 9, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-            else:
-                self.target_layer+=Jump_step[2] 
 
-        x = F.max_pool2d(x, 2, 2)
+        x = F.max_pool2d(x, 2, 2) # 4*4*256*256
+        current_layer = 11
         if self.target_layer == 11:
-            x_exit_1 = self.exit_2(x)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x) 
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[10])
+            #count += 4*4*256*256 + 4*4*256*64 + 64 * (2*10-1)
             if ratio >= 1:
                 self.num_early_exit_list[10] += 1
                 return 10, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-            else:
-                self.target_layer+=Jump_step[2] 
         
-        x = F.relu(self.bn9(self.conv9(x)))
+        x = F.relu(self.bn9(self.conv9(x))) # 256*512*4*4
+        current_layer = 12
         if self.target_layer == 12:
-            x_exit_1 = self.exit_3(x)
-            x_exit_1 = self.exit_0_fc(x_exit_1)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[11])
+            #count += 256*512*4*4 + 4*4*512*64 + 512 * (2*64-1) + 64 * (2*10-1)
             if ratio >= 1:
                 self.num_early_exit_list[11] += 1
                 return 11, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-            else:
-                self.target_layer+=Jump_step[2]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num 
 
-        x = F.relu(self.bn10(self.conv10(x)))
+        x = F.relu(self.bn10(self.conv10(x))) #512*512*4*4
+        current_layer = 13
         if self.target_layer == 13:
-            x_exit_1 = self.exit_3(x)
-            x_exit_1 = self.exit_0_fc(x_exit_1)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[12])
+            #count += 512*512*4*4 +  4*4*512*64 + 512 * (2*64-1) + 64 * (2*10-1)
             if ratio >= 1:
                 self.num_early_exit_list[12] += 1
                 return 12, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-            else:
-                self.target_layer+=Jump_step[2]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-             
-        x = F.relu(self.bn11(self.conv11(x)))
+          
+        x = F.relu(self.bn11(self.conv11(x))) #512*512*4*4
+        current_layer = 14
         if self.target_layer == 14:
-            x_exit_1 = self.exit_3(x)
-            x_exit_1 = self.exit_0_fc(x_exit_1)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[13])
+            #count += 512*512*4*4 + 4*4*512*64 + 512 * (2*64-1) + 64 * (2*10-1)
             if ratio >= 1:
                 self.num_early_exit_list[13] += 1
                 return 13, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-            else:
-                self.target_layer+=Jump_step[2]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
 
-        x = F.relu(self.bn12(self.conv12(x)))
+        x = F.relu(self.bn12(self.conv12(x))) #512*512*4*4
+        current_layer = 15
         if self.target_layer == 15:
-            x_exit_1 = self.exit_3(x)
-            x_exit_1 = self.exit_0_fc(x_exit_1)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[14])
+            #count += 512*512*4*4 + 4*4*512*64 + 512 * (2*64-1) + 64 * (2*10-1)
             if ratio >= 1:
                 self.num_early_exit_list[14] += 1
                 return 14, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-            else:
-                self.target_layer+=Jump_step[2]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
 
-        x = F.max_pool2d(x, 2, 2)
+        x = F.max_pool2d(x, 2, 2) #512*512*2*2     
+        current_layer = 16
         if self.target_layer == 16:
-            x_exit_1 = self.exit_3(x)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[15])
+            #count += 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1)
+            time1 = time.perf_counter()
+            layer_st = current_layer    
             if ratio >= 1:
                 self.num_early_exit_list[15] += 1
                 return 15, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-            else:
-                self.target_layer+=Jump_step[2]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
 
-        x = F.relu(self.bn13(self.conv13(x)))
+        x = F.relu(self.bn13(self.conv13(x))) #512*512*2*2
+        current_layer = 17
         if self.target_layer == 17:
-            x_exit_1 = self.exit_3(x)
-         #   x_exit_1 = self.exit_0_fc(x_exit_1)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[16])
+            #count += 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1)
             if ratio >= 1:
                 self.num_early_exit_list[16] += 1
                 return 16, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-            else:
-                self.target_layer+=Jump_step[2]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
 
-        x = F.relu(self.bn14(self.conv14(x)))
+        x = F.relu(self.bn14(self.conv14(x))) #512*512*2*2
+        current_layer = 18
         if self.target_layer == 18:
-            x_exit_1 = self.exit_3(x)
-         #   x_exit_1 = self.exit_0_fc(x_exit_1)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[17])
+            #count += 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1)  
             if ratio >= 1:
                 self.num_early_exit_list[17] += 1
                 return 17, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-            else:
-                self.target_layer+=Jump_step[2]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
 
-        x = F.relu(self.bn15(self.conv15(x)))
+        x = F.relu(self.bn15(self.conv15(x))) #512*512*2*2
+        current_layer = 19
         if self.target_layer == 19:
-            x_exit_1 = self.exit_3(x)
-       #     x_exit_1 = self.exit_0_fc(x_exit_1)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[18])
+            #count += 512*512*2*2 +  2*2*512*64 + 64 * (2*10-1)
             if ratio >= 1:
                 self.num_early_exit_list[18] += 1
                 return 18, exit1
-            elif ratio > 0.7:
-                self.target_layer+=Jump_step[0]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-            elif ratio > 0.4:
-                self.target_layer+=Jump_step[1]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
-            else:
-                self.target_layer+=Jump_step[2]
-                if self.target_layer > self.exit_num:
-                    self.target_layer = self.exit_num
         
-        x = F.relu(self.bn16(self.conv16(x)))
+        x = F.relu(self.bn16(self.conv16(x))) #512*512*2*2
+        current_layer = 20
         if self.target_layer == 20:
-            x_exit_1 = self.exit_3(x)
-       #     x_exit_1 = self.exit_0_fc(x_exit_1)
-            exit1 = self.exit_1_fc(x_exit_1)
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
             ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[19])
+            #count += 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1)
+            layer_st = current_layer    
             if ratio >= 1:
                 self.num_early_exit_list[19] += 1
                 return 19, exit1
     
         x = F.max_pool2d(x, 2, 2)
         x = F.avg_pool2d(x, 1)
-        x = x.view(-1, 512)
+        x = x.reshape(-1, 512)
         x = self.fc(x)
+        #count += 512*512*2*2*4 + 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1) + 512*512*4*4*4 + 4*4*256*256 + 4*4*256*64 + 64 * (2*10-1) + 8*8*256*256*4 + 8*8*128*64 + 64 * 19
         self.original += 1
-        return 3, x
-    '''
+        return 20, x
+
+
+    def test_on_train_normal_forward( self, x ):
+        self.target_layer = self.start_layer
+        count = 0
+        time2 = 0
+        time1 = time.perf_counter()
+        layer_st = 0
+        layer_end = 0
+        if self.quant_switch == 1:
+            x = self.quant(x)
+
+        x = F.relu(self.bn1(self.conv1(x))) #3*32*64*32
+        self.count_store[3] += 3*32*64*32
+        current_layer = 1
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256*127
+            exit1 = self.exit_1_fc(x_exit_1) #64*19
+            ratio = self._calculate_max_activation( exit1 ) / self.beta * self.activation_threshold_list[0]
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 32*64*64*32 + 256*127 + 64*19
+            layer_end = current_layer          
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer     
+            if ratio >= 1:
+                self.num_early_exit_list[0] += 1
+                return 0, exit1
+
+
+        x = F.relu(self.bn2(self.conv2(x))) #32*32*64*64
+        self.count_store[3] += 32*32*64*64
+        current_layer = 2
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[1])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 32*64*64*32 + 256*127 + 64*19
+            layer_end = current_layer         
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[1] += 1
+                return 1, exit1
+            
+        x = F.max_pool2d(x, 2, 2) #32*32*64*64
+        self.count_store[3] += 32*32*64*64
+        current_layer = 3
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_0(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_0(x)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[2])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 32*64*64*32 + 64*19
+            layer_end = current_layer          
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[2] += 1
+                return 2, exit1    
+
+        x = F.relu(self.bn3(self.conv3(x))) #16*16*128*128
+        self.count_store[3] += 16*128*16*128
+        current_layer = 4
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[3])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 16*16*128*64 + 127*64+ 64*19
+            layer_end = current_layer           
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[3] += 1
+                return 3, exit1
+
+            
+        x = F.relu(self.bn4(self.conv4(x))) #16*16*128*128
+        self.count_store[3] += 16*16*128*128
+        current_layer = 5
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[4])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 16*16*128*64 + 127*64+ 64*19
+            layer_end = current_layer        
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer                
+            if ratio >= 1:
+                self.num_early_exit_list[4] += 1
+                return 4, exit1
+
+
+        x = F.max_pool2d(x, 2, 2) #16*16*128*128
+        self.count_store[3] += 16*16*128*128
+        current_layer = 6
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_1(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_1(x)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * 19
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[5])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] +=  8*8*128*64 + 64 * 19
+            layer_end = current_layer           
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[5] += 1
+                return 5, exit1
+
+        x = F.relu(self.bn5(self.conv5(x))) # 8*8*128*256
+        self.count_store[3] += 8*8*128*256
+        current_layer = 7
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64*19
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[6])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 8*8*256*64 + 256 * (2*64-1) + 64*19
+            layer_end = current_layer          
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[6] += 1
+                return 6, exit1
+
+        x = F.relu(self.bn6(self.conv6(x))) # 8*8*256*256
+        self.count_store[3] += 8*8*256*256
+        current_layer = 8
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64*19
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[7])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] +=8*8*256*64 + 256 * (2*64-1) + 64*19
+            layer_end = current_layer          
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[7] += 1
+                return 7, exit1
+
+
+        x = F.relu(self.bn7(self.conv7(x))) # 8*8*256*256
+        self.count_store[3] += 8*8*256*256
+        current_layer = 9
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[8])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 8*8*256*64 + 256 * (2*64-1) + 64*19
+            layer_end = current_layer          
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[8] += 1
+                return 8, exit1
+
+        
+        x = F.relu(self.bn8(self.conv8(x))) # 8*8*256*256
+        self.count_store[3] += 8*8*256*256
+        current_layer = 10
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1)# 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[9])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 8*8*256*64 + 256 * (2*64-1) + 64*19
+            layer_end = current_layer     
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[9] += 1
+                return 9, exit1
+
+
+        x = F.max_pool2d(x, 2, 2) # 4*4*256*256
+        self.count_store[3] += 4*4*256*256
+        current_layer = 11
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_2(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_2(x) 
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[10])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 4*4*256*64 + 64 * 19
+            layer_end = current_layer         
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[10] += 1
+                return 10, exit1
+
+        
+        x = F.relu(self.bn9(self.conv9(x))) # 256*512*4*4
+        self.count_store[3] += 256*512*4*4
+        current_layer = 12
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[11])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 4*4*512*64 + 512 * (2*64-1) + 64 * 19
+            layer_end = current_layer           
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[11] += 1
+                return 11, exit1
+
+        x = F.relu(self.bn10(self.conv10(x))) #512*512*4*4
+        self.count_store[3] += 512*512*4*4
+        current_layer = 13
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[12])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 512 * (2*64-1) + 64 * 19 + 4*4*512*64
+            layer_end = current_layer         
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[12] += 1
+                return 12, exit1
+             
+        x = F.relu(self.bn11(self.conv11(x))) #512*512*4*4
+        self.count_store[3] += 512*512*4*4
+        current_layer = 14
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[13])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 512 * (2*64-1) + 64 * 19 + 4*4*512*64
+            layer_end = current_layer          
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[13] += 1
+                return 13, exit1
+
+        x = F.relu(self.bn12(self.conv12(x))) #512*512*4*4
+        self.count_store[3] += 512*512*4*4
+        current_layer = 15
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[14])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 512 * (2*64-1) + 64 * 19 + 4*4*512*64
+            layer_end = current_layer           
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[14] += 1
+                return 14, exit1
+
+        x = F.max_pool2d(x, 2, 2) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        current_layer = 16
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[15])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 2*2*512*64 + 64 * 19
+            layer_end = current_layer         
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[15] += 1
+                return 15, exit1
+
+        x = F.relu(self.bn13(self.conv13(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        current_layer = 17
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[16])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 2*2*512*64 + 64 * 19
+            layer_end = current_layer          
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[16] += 1
+                return 16, exit1
+
+        x = F.relu(self.bn14(self.conv14(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        current_layer = 18
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[17])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 2*2*512*64 + 64 * 19
+            layer_end = current_layer          
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[17] += 1
+                return 17, exit1
+
+        x = F.relu(self.bn15(self.conv15(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        current_layer = 19
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[18])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 2*2*512*64 + 64 * 19
+            layer_end = current_layer
+            if count == 0:           
+                self.count_store[0] += time2 - time1
+                self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[18] += 1
+                return 18, exit1
+        
+        x = F.relu(self.bn16(self.conv16(x))) #512*512*2*2
+        self.count_store[3] += 512*512*2*2
+        current_layer = 20
+        if current_layer in self.possible_layer:
+            if self.quant_switch == 1:
+                x_exit_1 =  self.exit_3(self.dequant(x))
+            else:
+                x_exit_1 = self.exit_3(x)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[19])
+            time2 = time.perf_counter()  #Time Sign
+            self.count_store[3] += 2*2*512*64 + 64 * 19
+            layer_end = current_layer         
+            self.count_store[0] += time2 - time1
+            self.layer_store[0] += layer_end - layer_st
+            time1 = time.perf_counter()
+            layer_st = current_layer    
+            if ratio >= 1:
+                self.num_early_exit_list[19] += 1
+                return 19, exit1
+    
+        x = F.max_pool2d(x, 2, 2)
+        x = F.avg_pool2d(x, 1)
+        x = x.reshape(-1, 512)
+        x = self.fc(x)
+        if self.quant_switch == 1:
+            x = self.dequant(x)
+        #count += 512*512*2*2*4 + 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1) + 512*512*4*4*4 + 4*4*256*256 + 4*4*256*64 + 64 * (2*10-1) + 8*8*256*256*4 + 8*8*128*64 + 64 * 19
+        time2 = time.perf_counter()  #Time Sign
+        layer_end = current_layer          
+        self.count_store[0] += time2 - time1
+        self.layer_store[0] += layer_end - layer_st
+        time1 = time.perf_counter()
+        layer_st = current_layer    
+        self.original += 1
+        return 20, x
+
+
+    def quant_forward( self, x ):
+        count = 0
+        x = self.quant(x)
+        x = F.relu(self.bn1(self.conv1(x)))
+        current_layer = 1
+        if self.target_layer == 1:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_0(x_exit_1)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / self.beta * self.activation_threshold_list[0]
+            if ratio >= 1:
+                self.num_early_exit_list[0] += 1
+                return 0, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+
+        x = F.relu(self.bn2(self.conv2(x)))
+        current_layer = 2
+        if self.target_layer == 2:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_0(x_exit_1)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[1])
+            if ratio >= 1:
+                self.num_early_exit_list[1] += 1
+                return 1, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+            
+        x = F.max_pool2d(x, 2, 2)
+        current_layer = 3
+        if self.target_layer == 3:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_0(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[2])
+            if ratio >= 1:
+                self.num_early_exit_list[2] += 1
+                return 2, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)                
+
+        x = F.relu(self.bn3(self.conv3(x)))
+        current_layer = 4
+        if self.target_layer == 4:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_1(x_exit_1)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[3])
+            if ratio >= 1:
+                self.num_early_exit_list[3] += 1
+                return 3, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+            
+        x = F.relu(self.bn4(self.conv4(x)))
+        current_layer = 5
+        if self.target_layer == 5:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_1(x_exit_1)
+            x_exit_1 = self.exit_0_fc(x_exit_1)
+            exit1 = self.exit_1_fc(x_exit_1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[4])
+            if ratio >= 1:
+                self.num_early_exit_list[4] += 1
+                return 4, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+
+        x = F.max_pool2d(x, 2, 2)
+        #####################################################################################
+        '''
+        x_exit_1 = self.exit_1(x)
+        exit1 = self.exit_1_fc(x_exit_1)
+        count += 8*8*128*64 + 64 * 19
+        ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[5])
+        if ratio >= 1:
+            self.count_store.append(count)
+            self.num_early_exit_list[5] += 1
+            return 5, exit1
+        '''
+        #####################################################################################
+        current_layer = 6
+        if self.target_layer == 6:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_1(x_exit_1) #8*8*128*64
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * 19
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[5])
+            count += 8*8*128*64 + 64 * 19
+            if ratio >= 1:
+                self.num_early_exit_list[5] += 1
+                self.count_store.append(count)
+                return 5, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+
+        x = F.relu(self.bn5(self.conv5(x))) # 8*8*128*256
+        current_layer = 7
+        if self.target_layer == 7:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_2(x_exit_1) # 8*8*256*64
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64*19
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[6])
+            count += 8*8*128*256 + 8*8*256*64 + 256 * (2*64-1) + 64*19
+            if ratio >= 1:
+                self.num_early_exit_list[6] += 1
+                self.count_store.append(count)
+                return 6, exit1
+            else:
+               self.target_layer +=  self.prediction(exit1, current_layer)
+
+        x = F.relu(self.bn6(self.conv6(x))) # 8*8*256*256
+        current_layer = 8
+        if self.target_layer == 8:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_2(x_exit_1)   # 8*8*256*64
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64*19
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[7])
+            count += 8*8*256*256 + 8*8*256*64 + 256 * (2*64-1) + 64*19
+            if ratio >= 1:
+                self.count_store.append(count)
+                self.num_early_exit_list[7] += 1
+                return 7, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+
+        x = F.relu(self.bn7(self.conv7(x))) # 8*8*256*256
+        current_layer = 9
+        if self.target_layer == 9:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_2(x_exit_1)  # 8*8*256*64
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[8])
+            count +=  8*8*256*256 + 8*8*256*64 + 256 * (2*64-1) + 64*19
+            if ratio >= 1:
+                self.count_store.append(count)
+                self.num_early_exit_list[8] += 1
+                return 8, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+        
+        x = F.relu(self.bn8(self.conv8(x))) # 8*8*256*256
+        current_layer = 10
+        if self.target_layer == 10:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_2(x_exit_1) # 8*8*256*64 
+            x_exit_1 = self.exit_0_fc(x_exit_1)# 256 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[9])
+            count += 8*8*256*256 + 8*8*256*64 + 256 * (2*64-1) + 64*19
+            if ratio >= 1:
+                self.count_store.append(count)
+                self.num_early_exit_list[9] += 1
+                return 9, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+
+        x = F.max_pool2d(x, 2, 2) # 4*4*256*256
+        ##############################################################################################
+        '''
+        x_exit_1 = self.exit_2(x) # 4*4*256*64 
+        exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+        ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[10])
+        count += 4*4*256*256 + 4*4*256*64 + 64 * (2*10-1) + 8*8*256*256*4 + 8*8*128*64 + 64 * 19
+        if ratio >= 1:
+            self.count_store.append(count)
+            self.num_early_exit_list[10] += 1
+            return 10, exit1
+        '''
+        ###############################################################################################
+        current_layer = 11
+        if self.target_layer == 11:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_2(x_exit_1) # 4*4*256*64 
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[10])
+            count += 4*4*256*256 + 4*4*256*64 + 64 * (2*10-1)
+            if ratio >= 1:
+                self.count_store.append(count)
+                self.num_early_exit_list[10] += 1
+                return 10, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer) 
+        
+        x = F.relu(self.bn9(self.conv9(x))) # 256*512*4*4
+        current_layer = 12
+        if self.target_layer == 12:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_3(x_exit_1) # 4*4*512*64
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[11])
+            count += 256*512*4*4 + 4*4*512*64 + 512 * (2*64-1) + 64 * (2*10-1)
+            if ratio >= 1:
+                self.count_store.append(count)
+                self.num_early_exit_list[11] += 1
+                return 11, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num 
+
+        x = F.relu(self.bn10(self.conv10(x))) #512*512*4*4
+        current_layer = 13
+        if self.target_layer == 13:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_3(x_exit_1) # 4*4*512*64
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[12])
+            count += 512*512*4*4 +  4*4*512*64 + 512 * (2*64-1) + 64 * (2*10-1)
+            if ratio >= 1:
+                self.count_store.append(count)
+                self.num_early_exit_list[12] += 1
+                return 12, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+             
+        x = F.relu(self.bn11(self.conv11(x))) #512*512*4*4
+        current_layer = 14
+        if self.target_layer == 14:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_3(x_exit_1) # 4*4*512*64
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[13])
+            count += 512*512*4*4 + 4*4*512*64 + 512 * (2*64-1) + 64 * (2*10-1)
+            if ratio >= 1:
+                self.count_store.append(count)
+                self.num_early_exit_list[13] += 1
+                return 13, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+
+        x = F.relu(self.bn12(self.conv12(x))) #512*512*4*4
+        current_layer = 15
+        if self.target_layer == 15:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_3(x_exit_1) # 4*4*512*64
+            x_exit_1 = self.exit_0_fc(x_exit_1) # 512 * (2*64-1)
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[14])
+            count += 512*512*4*4 + 4*4*512*64 + 512 * (2*64-1) + 64 * (2*10-1)
+            if ratio >= 1:
+                self.count_store.append(count)
+                self.num_early_exit_list[14] += 1
+                return 14, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+
+        x = F.max_pool2d(x, 2, 2) #512*512*2*2
+        #################################################################################
+        '''
+        x_exit_1 = self.exit_3(x) # 2*2*512*64
+        exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+        ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[15])
+        count += 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1) + 512*512*4*4*4 + 4*4*256*256 + 4*4*256*64 + 64 * (2*10-1) + 8*8*256*256*4 + 8*8*128*64 + 64 * 19
+        if ratio >= 1:
+            self.count_store.append(count)
+            self.num_early_exit_list[15] += 1
+            return 15, exit1   
+        '''
+        ###############################################################################     
+        current_layer = 16
+        if self.target_layer == 16:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_3(x_exit_1) # 2*2*512*64
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[15])
+            count += 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1)
+            if ratio >= 1:
+                self.count_store.append(count)
+                self.num_early_exit_list[15] += 1
+                return 15, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+
+        x = F.relu(self.bn13(self.conv13(x))) #512*512*2*2
+        current_layer = 17
+        if self.target_layer == 17:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_3(x_exit_1)  # 2*2*512*64
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[16])
+            count += 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1)
+            if ratio >= 1:
+                self.count_store.append(count)
+                self.num_early_exit_list[16] += 1
+                return 16, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+
+        x = F.relu(self.bn14(self.conv14(x))) #512*512*2*2
+        current_layer = 18
+        if self.target_layer == 18:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_3(x_exit_1)  # 2*2*512*64
+            exit1 = self.exit_1_fc(x_exit_1)  # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[17])
+            count += 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1)
+            if ratio >= 1:
+                self.count_store.append(count)
+                self.num_early_exit_list[17] += 1
+                return 17, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+
+        x = F.relu(self.bn15(self.conv15(x))) #512*512*2*2
+        current_layer = 19
+        if self.target_layer == 19:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_3(x_exit_1) # 2*2*512*64
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[18])
+            count += 512*512*2*2 +  2*2*512*64 + 64 * (2*10-1)
+            if ratio >= 1:
+                self.count_store.append(count)
+                self.num_early_exit_list[18] += 1
+                return 18, exit1
+            else:
+                self.target_layer +=  self.prediction(exit1, current_layer)
+                if self.target_layer > self.exit_num:
+                    self.target_layer = self.exit_num
+        
+        x = F.relu(self.bn16(self.conv16(x))) #512*512*2*2
+        current_layer = 20
+        if self.target_layer == 20:
+            x_exit_1 = self.dequant(x)
+            x_exit_1 = self.exit_3(x_exit_1) # 2*2*512*64
+            exit1 = self.exit_1_fc(x_exit_1) # 64 * (2*10-1)
+            ratio = self._calculate_max_activation( exit1 ) / (self.beta * self.activation_threshold_list[19])
+            count += 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1)
+            if ratio >= 1:
+                self.count_store.append(count)
+                self.num_early_exit_list[19] += 1
+                return 19, exit1
+    
+        x = F.max_pool2d(x, 2, 2)
+        x = F.avg_pool2d(x, 1)
+        x = x.reshape(-1, 512)
+        x = self.fc(x)
+        count += 512*512*2*2*4 + 512*512*2*2 + 2*2*512*64 + 64 * (2*10-1) + 512*512*4*4*4 + 4*4*256*256 + 4*4*256*64 + 64 * (2*10-1) + 8*8*256*256*4 + 8*8*128*64 + 64 * 19
+        self.count_store.append(count)
+        self.original += 1
+        x = self.dequant(x)
+        return 20, x
+
 
 class vgg19_exits_train_jump( vgg19_exits_eval_jump ):
     def __init__( self ):
@@ -1353,7 +3265,11 @@ class vgg19_exits_train_jump( vgg19_exits_eval_jump ):
         x_exit_20 = self.exit_3(x)
         exit20 = self.exit_1_fc(x_exit_20)
 
-        return (exit1, exit2, exit3, exit4, exit5, exit6, exit7, exit8, exit9, exit10, exit11, exit12, exit13, exit14, exit15, exit16, exit17, exit18, exit19,exit20)
+        x = F.max_pool2d(x, 2, 2)
+        x = F.avg_pool2d(x, 1)
+        x = x.view(-1, 512)
+        x = self.fc(x)
+        return (exit1, exit2, exit3, exit4, exit5, exit6, exit7, exit8, exit9, exit10, exit11, exit12, exit13, exit14, exit15, exit16, exit17, exit18, exit19,exit20,x)
 
 
 
@@ -1594,7 +3510,16 @@ class vgg19_normal( nn.Module ):
         self.bn15 = nn.BatchNorm2d(512)
         self.conv16 = nn.Conv2d(512, 512, 3, 1, padding=1)  # maxpool2d
         self.bn16 = nn.BatchNorm2d(512)
-        self.fc = nn.Linear(512, data_type)
+        self.fc = nn.Linear(512*2*2, data_type)
+        self.classifier = nn.Sequential(
+            nn.Linear(512 * 2 * 2, 4096),
+            nn.ReLU(True),
+            nn.Dropout(),
+            nn.Linear(4096, 4096),
+            nn.ReLU(True),
+            nn.Dropout(),
+            nn.Linear(4096, data_type)
+        )
     
     def forward(self, x):
         x = F.relu(self.bn1(self.conv1(x)))
@@ -1617,349 +3542,28 @@ class vgg19_normal( nn.Module ):
         x = F.relu(self.bn14(self.conv14(x)))
         x = F.relu(self.bn15(self.conv15(x)))
         x = F.relu(self.bn16(self.conv16(x)))
-        x = F.max_pool2d(x, 2, 2)
+  #      x = F.max_pool2d(x, 2, 2)
         x = F.avg_pool2d(x, 1)
-        x = x.view(-1, 512)
-        x = self.fc(x)
+        x = x.view(-1, 512*2*2)
+        x = self.classifier(x)
         return x
 
-
-class BasicBlock(nn.Module):
-    expansion = 1
-
-    def __init__(self, in_planes, planes, stride=1):
-        super(BasicBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != self.expansion*planes:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion*planes)
-            )
-
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
-        return out
-
-
-class Bottleneck(nn.Module):
-    expansion = 4
-
-    def __init__(self, in_planes, planes, stride=1):
-        super(Bottleneck, self).__init__()
-        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        self.conv3 = nn.Conv2d(planes, self.expansion*planes, kernel_size=1, bias=False)
-        self.bn3 = nn.BatchNorm2d(self.expansion*planes)
-
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != self.expansion*planes:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion*planes)
-            )
-
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = F.relu(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
-        return out
-
-
-class ResNet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10):
-        super(ResNet, self).__init__()
-        self.in_planes = 64
-
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
-        self.linear = nn.Linear(512*block.expansion, num_classes)
-
-    def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1]*(num_blocks-1)
-        layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
-            self.in_planes = planes * block.expansion
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-        out = F.avg_pool2d(out, 4)
-        out = out.view(out.size(0), -1)
-        out = self.linear(out)
-        return out
-
-
-class ResNet_exits_eval(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10):
-        super(ResNet_exits_eval, self).__init__()
-        self.in_planes = 64
-        self.exit_num = 3
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
-        self.linear = nn.Linear(512*block.expansion, num_classes)
-        # early exits
-        self.exit_1 = LogisticConvBoF(input_features=256, n_codewords=128, split_horizon=32)
-        self.exit_2 = LogisticConvBoF(input_features=512, n_codewords=128, split_horizon=16)
-        self.exit_3 = LogisticConvBoF(input_features=1024, n_codewords=128, split_horizon=8)
-        self.exit_1_fc = nn.Linear(128, num_classes)
-        # threshold for switching between layers
-        self.activation_threshold_1 = 0
-        self.activation_threshold_2 = 0
-        self.activation_threshold_3 = 0
-        self.num_early_exit_1 = 0
-        self.num_early_exit_2 = 0
-        self.num_early_exit_3 = 0
-        self.original = 0
-        # the beta coefficient used for accuracy-speed trade-off, the higher the more accurate
-        self.beta = 0
-
-    def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1]*(num_blocks-1)
-        layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
-            self.in_planes = planes * block.expansion
-        return nn.Sequential(*layers)
-    
-    def set_activation_thresholds( self, threshold_list:list ):
-        if len( threshold_list ) != self.exit_num:
-            print( f'the length of the threshold_list ({len(threshold_list)}) is invalid, should be {self.exit_num}' )
-            raise NotImplementedError
-        self.activation_threshold_1 = threshold_list[0]
-        self.activation_threshold_2 = threshold_list[1]
-        self.activation_threshold_3 = threshold_list[2]
-
-    def print_exit_percentage( self ):
-        total_inference = self.num_early_exit_1 + self.num_early_exit_2 + self.num_early_exit_3 + self.original
-        print( f'early exit 1: {100*self.num_early_exit_1/total_inference:.3f}% ({self.num_early_exit_1}/{total_inference})', end=' | ' )
-        print( f'early exit 2: {100*self.num_early_exit_2/total_inference:.3f}% ({self.num_early_exit_2}/{total_inference})', end=' | ' )
-        print( f'early exit 3: {100*self.num_early_exit_3/total_inference:.3f}% ({self.num_early_exit_3}/{total_inference})', end=' | ' )
-        print( f'original: {100*self.original/total_inference:.3f}% ({self.original}/{total_inference})' )
-
-    def set_beta( self, beta ):
-        self.beta = beta
-    
-    def _calculate_max_activation( self, param ):
-        '''
-        return the maximum activation item in [param]
-        '''
-        return torch.max( torch.abs( torch.max( param ) ), torch.abs( torch.min( param ) ) )
-
-
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        # Early Exit Part
-        
-        out_exit_1 = self.exit_1(out)
-        exit1 = self.exit_1_fc(out_exit_1)
-        if self._calculate_max_activation( exit1 ) > self.beta * self.activation_threshold_1:
-            self.num_early_exit_1 += 1
-            return 0, exit1
-        # Normal NetWork
-        out = self.layer2(out)
-        # Early Exit Part
-        out_exit_2 = self.exit_2(out)
-        exit2 = (out_exit_1 + out_exit_2) / 2
-        exit2 = self.exit_1_fc(exit2)
-        if self._calculate_max_activation( exit2 ) > self.beta * self.activation_threshold_2:
-            self.num_early_exit_2 += 1
-            return 1, exit2
-        # Normal NetWork
-        out = self.layer3(out)
-        # Early Exit Part
-        out_exit_3 = self.exit_3(out)
-        exit3 = (out_exit_1 + out_exit_2 + out_exit_3) / 3
-        exit3 = self.exit_1_fc(exit3)
-        if self._calculate_max_activation( exit3 ) > self.beta * self.activation_threshold_3:
-            self.num_early_exit_3 += 1
-            return 2, exit3
-        # Normal NetWork
-        out = self.layer4(out)
-        out = F.avg_pool2d(out, 4)
-        out = out.view(out.size(0), -1)
-        out = self.linear(out)
-        self.original += 1
-        return 3, out
-
-
-
-class ResNet_exits_train(ResNet_exits_eval):
-    def __init__(self, block, num_blocks, num_classes):
-        super().__init__(block, num_blocks, num_classes)
-        self.exit_layer = 'original'
-    
-    def set_exit_layer(self, exit_layer):
-        if exit_layer not in ['original', 'exits']:
-            print( f'Error: exit_layer ({exit_layer}) is invalid. Should be original or exits' )
-            raise NotImplementedError
-        self.exit_layer = exit_layer
-    
-    # the functions starting from here should be updated by json initializations!
-    def forward( self, x ):
-        if self.exit_layer == 'original':
-            return self.forward_original( x )
-        elif self.exit_layer == 'exits':
-            return self.forward_exits( x )
-    
-    def forward_original( self, x ):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-        out = F.avg_pool2d(out, 4)
-        out = out.view(out.size(0), -1)
-        out = self.linear(out)
-        return out
-
-    def forward_exits(self,x):
-        out = F.relu(self.bn1(self.conv1(x)))
-
-        out = self.layer1(out)
-        out_exit_1 = self.exit_1(out)
-        exit1 = self.exit_1_fc(out_exit_1)
-
-        out = self.layer2(out)
-        out_exit_2 = self.exit_2(out)
-        exit2 = (out_exit_1 + out_exit_2) / 2
-        exit2 = self.exit_1_fc(exit2)
-
-        out = self.layer3(out)
-        out_exit_3 = self.exit_3(out)
-        exit3 = (out_exit_1 + out_exit_2 + out_exit_3) / 3
-        exit3 = self.exit_1_fc(exit3)
-
-        out = self.layer4(out)
-        out = F.avg_pool2d(out, 4)
-        out = out.view(out.size(0), -1)
-        out = self.linear(out)
-        return (exit1, exit2, exit3)
-
-
-def ResNet18_normal(args):
-    return ResNet(BasicBlock, [2,2,2,2])
-
-def ResNet34_normal(args):
-    if args.dataset_type == 'cifar10':
-        return ResNet(BasicBlock, [3,4,6,3], num_classes=10)
-    else:
-        return ResNet(BasicBlock, [3,4,6,3], num_classes=100)
-
-def ResNet50_normal(args):
-    if args.dataset_type == 'cifar10':
-        return ResNet(Bottleneck, [3,4,6,3], num_classes=10)
-    else:
-        return ResNet(Bottleneck, [3,4,6,3], num_classes=100)
-
-def ResNet101_normal(args):
-    if args.dataset_type == 'cifar10':
-        return ResNet(Bottleneck, [3,4,23,3], num_classes=10)
-    else:
-        return ResNet(Bottleneck, [3,4,23,3], num_classes=100)
-
-def ResNet152_normal(args):
-    if args.dataset_type == 'cifar10':
-        return ResNet(Bottleneck, [3,8,36,3], num_classes=10)
-    else:
-        return ResNet(Bottleneck, [3,8,36,3], num_classes=100)
-
-
-def ResNet34_exits_train(args):
-    if args.dataset_type == 'cifar10':
-        return ResNet_exits_train(Bottleneck, [3,8,36,3], num_classes=10)
-    else:
-        return ResNet_exits_train(Bottleneck, [3,8,36,3], num_classes=100)
-
-
-def ResNet34_exits_eval(args):
-    if args.dataset_type == 'cifar10':
-        return ResNet_exits_eval(Bottleneck, [3,8,36,3], num_classes=10)
-    else :
-        return ResNet_exits_eval(Bottleneck, [3,8,36,3], num_classes=100)
 
 
 
 
 
 if __name__ == '__main__':
-    args = utils.Namespace( model_name='vgg19',
+    args = utils.Namespace( model_name='resnet',
                             pretrained_file='autodl-tmp/vgg19_train_exits_cifar10.pt',
                             optimizer='adam',
-                            train_mode='exits',
+                            train_mode='original',
                             evaluate_mode='exits',
-                            task='evaluate',
+                            task='train',
                             device='cuda',
-                            trained_file_suffix='update_1',
+                            trained_file_suffix='cifar10',
                             beta=9,
                             save=0,
                             dataset_type = 'cifar10',
                             jump = 1
                             )
-    model = ResNet34_exits_train(args)
-
-    hyper = gp.get_hyper( args )
-    model = torch.load( args.pretrained_file, map_location='cpu' ).to( args.device )
-    
-    model.set_exit_layer( 'exits' )
-    optimizer = gp.get_optimizer( params=model.parameters(), lr=hyper.learning_rate, op_type=args.optimizer )
-    train_loader = gp.get_dataloader( args, task='train' )
-    model.train()
-    for epoch_idx in range( hyper.epoch_num ):
-        print(f'\nEpoch: {(epoch_idx + 1)}')
-        train_loss = 0
-        correct_exit = None
-        total = 0
-        for batch_idx, ( images, labels ) in enumerate( train_loader ):
-            images, labels = images.to( args.device ), labels.to( args.device )
-            optimizer.zero_grad()
-            exit_tuple = model( images )
-            loss = 0
-            for exit_idx in range( len( exit_tuple ) ):
-                loss += gp.criterion( exit_tuple[exit_idx], labels )
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-            exit_predicted_list = [None for i in range( len( exit_tuple ) )]
-            for exit_idx in range( len( exit_tuple ) ):
-                _, exit_predicted_list[exit_idx] = exit_tuple[exit_idx].max( 1 )
-            total += labels.size( 0 )
-            if correct_exit is None:
-                correct_exit = [0 for i in range( len( exit_tuple ) )]
-            for exit_idx in range( len( exit_tuple ) ):
-                correct_exit[exit_idx] += exit_predicted_list[exit_idx].eq( labels ).sum().item()
-            if batch_idx % 100 == 99:    # print every 100 mini-batches
-                print( '[%d, %5d] loss: %.5f |' % (epoch_idx + 1, batch_idx + 1, train_loss / 2000), end='' )
-                for exit_idx in range( len( exit_tuple ) ):
-                    print( '| exit'+str(exit_idx)+': %.3f%% (%d/%d)' % (100.*correct_exit[exit_idx]/total, correct_exit[exit_idx], total), end='' )
-                print( '' )
-                # model.print_average_activations()
-                train_loss, total = 0, 0
-                correct_exit = None
-        if epoch_idx % 5 == 4:
-            print( f'begin middle test:' )

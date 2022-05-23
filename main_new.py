@@ -60,6 +60,8 @@ def get_args():
                         help='the dataset we choose' )
     parser.add_argument('--jump', default=0, type=int, 
                         help='the exit type we choose for Vgg19' )
+    parser.add_argument('--quantization', default=0, type=int, 
+                        help='the mode we choose during inference, whether normal or quantization' )
     args = parser.parse_args()
     args.torch_device = torch.device( 'cpu' ) if args.device == 'cpu' else torch.device( 'cuda' )
     return args

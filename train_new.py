@@ -38,9 +38,6 @@ def train_normal( args ):
     # training setup
     hyper = gp.get_hyper( args )
     model = get_train_model( args ).to( args.device )
-    a = 1
-    print(a)
-    print( hyper )
     optimizer = gp.get_optimizer( params=model.parameters(), lr=hyper.learning_rate, op_type=args.optimizer )
     train_loader = gp.get_dataloader( args, task='train' )
     # begin training
@@ -185,7 +182,7 @@ def train_original( args ):
             else:
                 num_no_increase += 1
     test_normal( model, args, verbose=True )
-    # print( utils.create_model_file_name( args ) )
+    print( utils.create_model_file_name( args ) )
     if args.save: torch.save( model, utils.create_model_file_name( args ) )
 
 
@@ -255,7 +252,7 @@ def test_exits( model, args ):
         train_flag = True
     else:
         train_flag = False
-    correct_exit = [0 for i in range( model.exit_num )]
+    correct_exit = [0 for i in range( 33 )]
     total = 0
     test_loader = gp.get_dataloader( args, task='test' )
     with torch.no_grad():
@@ -281,19 +278,21 @@ def test_exits( model, args ):
         model.train()
 
 def simple_try():
-    args = utils.Namespace( model_name='vgg19',
-                            pretrained_file='models_new/vgg19_train_exits_update_1.pt',
+    args = utils.Namespace( model_name='resnet',
+                            pretrained_file='autodl-tmp/vgg19_train_exits_cifar100.pt',
                             optimizer='adam',
-                            train_mode='normal',
+                            train_mode='original',
                             evaluate_mode='exits',
                             task='train',
-                            device='cpu',
-                            trained_file_suffix='round_1',
+                            device='cuda',
+                            trained_file_suffix='cifar100',
                             beta=9,
                             save=0,
-                            dataset_type=100)
+                            dataset_type = 'cifar100',
+                            jump = 1
+                            )
     
-    train_normal(args)
+    train(args)
 
 if __name__ == '__main__':
     simple_try()

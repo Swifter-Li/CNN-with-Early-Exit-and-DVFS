@@ -63,6 +63,66 @@ num_testcase_continuous = 5
 
 num_testcase_periodical = 3
 
+
+cifar10_computataional_cost ={
+    1: (3*32*64*32, 32*64*64*32),
+    2: (32*32*64*64, 32*64*64*32),
+    3: (32*32*64*64, 32*64*64*32),
+    4: (16*16*128*128, 16*16*128*64),
+    5: (16*16*128*128, 16*16*128*64),
+    6: (16*16*128*128, 8*8*128*64),
+    7: (8*8*128*256, 8*8*256*64),
+    8: (8*8*256*256, 8*8*256*64),
+    9: (8*8*256*256, 8*8*256*64),
+    10: (8*8*256*256, 8*8*256*64),
+    11: (4*4*256*256, 4*4*256*64 ),
+    12: (256*512*4*4, 4*4*512*64),
+    13: (512*512*4*4, 4*4*512*64),
+    14: (512*512*4*4, 4*4*512*64),
+    15: (512*512*4*4, 4*4*512*64),
+    16: (512*512*2*2, 2*2*512*64),
+    17: (512*512*2*2, 2*2*512*64),
+    18: (512*512*2*2, 2*2*512*64),
+    19: (512*512*2*2, 2*2*512*64),
+    20: (512*512*2*2, 2*2*512*64)
+}
+
+resnet_computataional_cost ={
+    1: (4390912, 32*64*64*32),
+    2: (64*32*64*32*2, 32*64*64*32),
+    3: (32*32*64*64, 32*64*64*32),
+    4: (32*32*64*64*2, 32*64*64*32),
+    5: (32*32*64*64, 32*64*64*32),
+    6: (32*32*64*64*2, 32*64*64*32),
+    7: (32*32*128*128, 32*32*128*64),
+    8: (32*32*128*128+32*32*64*128, 32*32*128*64),
+    9: (32*32*128*128, 32*32*128*64),
+    10: (32*32*128*128*2, 32*32*128*64),
+    11: (32*32*128*128, 32*32*128*64 ),
+    12: (32*32*128*128*2, 32*32*128*64),
+    13: (32*32*128*128, 32*32*128*64),
+    14: (32*32*128*128*2, 32*32*128*64),
+    15: (32*32*256*128, 32*32*256*64),
+    16: (32*32*256*256 + 32*32*256*128, 32*32*256*64),
+    17: (32*32*256*256, 32*32*256*64),
+    18: (32*32*256*256*2, 32*32*256*64),
+    19: (32*32*256*256, 32*32*256*64),
+    20: (32*32*256*256*2, 32*32*256*64),
+    21: (32*32*256*256, 32*32*256*64),
+    22: (32*32*256*256*2, 32*32*256*64),
+    23: (32*32*256*256, 32*32*256*64),
+    24: (32*32*256*256*2,32*32*256*64),
+    25: (32*32*256*256, 32*32*256*64),
+    26: (32*32*256*256*2, 32*32*256*64),
+    27: (32*32*512*256, 32*32*512*64),
+    28: (32*32*512*256 + 32*32*512*512, 32*32*512*64),
+    29: (32*32*512*512, 32*32*512*64),
+    30: (32*32*512*512*2, 32*32*512*64),
+    31: (32*32*512*512, 32*32*512*64),
+    32: (32*32*512*512*2, 32*32*512*64),
+}
+
+
 ##############################################################################
 ###                                 METHOD                                 ###
 ##############################################################################
@@ -118,6 +178,11 @@ def get_dataloader( args, task ):
     if task == 'test':
         return torch.utils.data.DataLoader( test_dataset, 
                                             batch_size=train_test_batch_size if args.task=='train' else evaluate_test_batch_size, 
+                                            shuffle=True, 
+                                            num_workers=4)
+    elif task == 'test_on_train':
+        return torch.utils.data.DataLoader( train_dataset, 
+                                            batch_size=evaluate_test_batch_size, 
                                             shuffle=True, 
                                             num_workers=4)
     elif task == 'train':
@@ -375,8 +440,8 @@ mnist_train_hyper = utils.Namespace(
 
 
 resnet_normal_train_hyper = utils.Namespace(
-    epoch_num = 50,
-    learning_rate = 0.0005,
+    epoch_num = 100,
+    learning_rate = 0.0001,
     batch_size = 128,
     transform = transforms.Compose([
         transforms.RandomHorizontalFlip(),
@@ -385,8 +450,8 @@ resnet_normal_train_hyper = utils.Namespace(
 )
 
 resnet_exits_train_hyper = utils.Namespace(
-    epoch_num = 50,
-    learning_rate = 0.0005,
+    epoch_num = 100,
+    learning_rate = 0.001,
     batch_size = 128,
     transform = transforms.Compose([
         transforms.RandomHorizontalFlip(),
@@ -395,8 +460,8 @@ resnet_exits_train_hyper = utils.Namespace(
 )
 
 resnet_original_train_hyper = utils.Namespace(
-    epoch_num = 50,
-    learning_rate = 0.0005,
+    epoch_num = 100,
+    learning_rate = 0.00025,
     batch_size = 128,
     transform = transforms.Compose([
         transforms.RandomHorizontalFlip(),
@@ -412,7 +477,7 @@ cifar_train_dataset_100 = torchvision.datasets.CIFAR100( root='./autodl-tmp/data
                                                     train=True, 
                                                     transform=cifar_normal_train_hyper.transform, 
                                                     download=True )
-
+############################################################################################################
 mnist_train_dataset = torchvision.datasets.MNIST( root='./autodl-tmp/data/mnist/', 
                                                     train=True, 
                                                     transform=mnist_train_hyper.transform, 
@@ -422,7 +487,7 @@ mnist_test_dataset = torchvision.datasets.MNIST( root='./autodl-tmp/data/mnist/'
                                                     train=False, 
                                                     transform=mnist_train_hyper.transform, 
                                                     download=False )
-
+#########################################################################################################################
 
 stl10_train_dataset = torchvision.datasets.STL10( root='./autodl-tmp/data/stl10/', 
                                                     split='train', 
@@ -433,6 +498,19 @@ stl10_test_dataset = torchvision.datasets.STL10( root='./autodl-tmp/data/stl10/'
                                                     split='test', 
                                                     transform=cifar_normal_train_hyper.transform, 
                                                     download=False )
+#######################################################################################################################
+
+svhn_train_dataset = torchvision.datasets.SVHN( root='./autodl-tmp/data/svhn/', 
+                                                    split='train', 
+                                                    transform=cifar_normal_train_hyper.transform, 
+                                                    download=True )
+
+svhn_test_dataset = torchvision.datasets.SVHN( root='./autodl-tmp/data/svhn/', 
+                                                    split='test', 
+                                                    transform=cifar_normal_train_hyper.transform, 
+                                                    download=True )
+
+###############################################################################################################################
 
 cifar_test_dataset_10 = torchvision.datasets.CIFAR10(  root='./autodl-tmp/data/cifar10/', 
                                                     train=False, 
