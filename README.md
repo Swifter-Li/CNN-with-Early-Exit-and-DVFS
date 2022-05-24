@@ -40,21 +40,21 @@ Inference</h2>
     - `bof_utils.py`  
     the data structure of BoF (Bag-of-Features) pooling
 - `global_param.py`  
-network initializations, the training and evaluation hyperparameters, the hardware configurations and so on
+  network initializations, the training and evaluation hyperparameters, the hardware configurations and so on
 - `inference_new.py`  
-inference of trained neural networks
+  inference of trained neural networks
 - `main_new.py`  
-the main program
+  the main program
 - `models_new.py`  
-the different types of neural network models including vgg19 for cifar10, cifar100
+  the different types of neural network models including vgg19 for cifar10, cifar100
 - `models_new_2.py`  
 the different types of neural network models including vgg19 for stl10, svhn
-`models_new_3.py`  
+- `models_new_3.py`  
 the different types of neural network models including Resnet-34
 - `train_new.py`  
-training of neural networks
+  training of neural networks
 - `utils_new.py`  
-some general functions
+  some general functions
 - `power_management_api/`  
     - `api.py`  
     the APIs that deal with hardwares in the embedded board Jetson TX2
@@ -68,11 +68,11 @@ some general functions
     - `train_inference.sh`  
     the shell script that does the training and then the inference task
 - `models_new/`  
-the directory that stores all the models
+  the directory that stores all the models
 - `create_custom_dataloader`  
-the functions to create customized dataloaders
+  the functions to create customized dataloaders
 - `generate_scripts.py`  
-the python program to generate shell scripts for testings automatically. Except for only very few cases, this file is useless. Feel free to delete it
+  the python program to generate shell scripts for testings automatically. Except for only very few cases, this file is useless. Feel free to delete it
 - `README.md`
 this file
 
@@ -137,5 +137,4 @@ After training the model, you may want to test the early exit results by doing s
 ```shell
 python3 main_new.py --model_name vgg19 --optimizer adam --train_mode exits --task evaluate --device cuda --pretrained_file autodl-tmp/vgg19_train_exits_cifar10.pt  --beta 15 --save 0 --dataset_type cifar10 --evaluate_mode exits --jump 1 --quantization 0 --forward_mode normal_forward --start_layer 8
 ```
-
 
