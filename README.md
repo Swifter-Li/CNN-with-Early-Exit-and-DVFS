@@ -48,9 +48,9 @@ Inference</h2>
 - `models_new.py`  
   the different types of neural network models including vgg19 for cifar10, cifar100
 - `models_new_2.py`  
-the different types of neural network models including vgg19 for stl10, svhn
+  the different types of neural network models including vgg19 for stl10, svhn
 - `models_new_3.py`  
-the different types of neural network models including Resnet-34
+  the different types of neural network models including Resnet-34
 - `train_new.py`  
   training of neural networks
 - `utils_new.py`  
@@ -60,15 +60,6 @@ the different types of neural network models including Resnet-34
     the APIs that deal with hardwares in the embedded board Jetson TX2
     - `README.md`  
     the detailed introductions for api functions
-- `scripts/`
-    - `inference_with_beta.sh`  
-    the shell script that do the inference tasks with different `beta` parameters
-    - `testcases.sh`  
-    the shell script that does all the tests specified in our report
-    - `train_inference.sh`  
-    the shell script that does the training and then the inference task
-- `models_new/`  
-  the directory that stores all the models
 - `create_custom_dataloader`  
   the functions to create customized dataloaders
 - `generate_scripts.py`  
@@ -102,7 +93,7 @@ Their meanings are specified as below. Note that not all arguments are meaningfu
 - `SUFFIX`: when `SAVE` is non-zero, the model would be saved in a .pt file whose name consists of some some setting parameters and the string `SUFFIX`. This option is set mainly used to differentiate files under the same hyperparameters, so that they do not overwrite each other.
 - `BETA`: the hyperparameter to control the tradeoff between accuracy and speed-up in early-exit scheme. Refer to the paper or our report for more details
 - `SAVE`: if non-zero, then save the model, otherwise does not save the model
-- `dataset_type`: cifar10, cifar100, stl10, svhn. When running stl10 in the Resnet, another pooling layer is required since its images are larger, so you need to modify one line code in line 20 of `model_news_3.py`. 
+- `dataset_type`: cifar10, cifar100, stl10, svhn. When running stl10 in the Resnet, another pooling layer is required since its images are larger, so you need to modify one line code in line 20 of `model_news_3.py`. When running cifar100 in the vgg19, you may also need to change one line code that change a variable named `datatype` from 10 to 100. 
 - `jump`: no use and set it as 1
 - `quantization`: 0 means  `Floart 32` and 1 means `int8`
 - `forward_mode`: either `normal_forward` or `accuracy_forward`. `normal_forward` means the program will run normal and `accuracy_forward` means the program start to test the prediction accuracy based on the start layer.
@@ -130,7 +121,7 @@ After that, you're gonna fix all the normal layers and start training the early 
 python3 main_new.py --model_name vgg19 --optimizer adam --train_mode exits --task train --device cuda --pretrained_file autodl-tmp/vgg19_train_original_cifar10.pt --trained_file_suffix cifar10 --save 1 --dataset_type cifar10 --jump 1
 ```
 
-Now basically you've done the training, and the trained model would be stored in `models_new/vgg19_train_exits_round_1.pt`. And from the command output, you'll be able to see the accuracy after the training. If you are not satisfied with the accuracy, you could modify the model structures or hyperparameters and then do the above steps again.
+Now basically you've done the training, and the trained model would be stored in `models_new/vgg19_train_exits_cifar10.pt`. And from the command output, you'll be able to see the accuracy after the training. If you are not satisfied with the accuracy, you could modify the model structures or hyperparameters and then do the above steps again.
 
 #### Inferences
 After training the model, you may want to test the early exit results by doing some inferences with different values of the parameter `beta`. If you want to do that on computers / servers, you will need to modify the codes in `inference_new.py` by removing all the commands regarding hardwares. Then the command you're gonna type in the shell would be like:
