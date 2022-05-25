@@ -1,18 +1,13 @@
 """
 DESCRIPTION:    this file contains the main program
 
-AUTHOR:         Lou Chenfei  Li Xiangjie
-
-INSTITUTE:      Shanghai Jiao Tong University, UM-SJTU Joint Institute
-
-PROJECT:        ECE4730J Advanced Embedded System Capstone Project
 """
 
 import argparse
 import torch
 
-from inference_new import inference
-from train_new import train
+from inference import inference
+from train import train
 from create_custom_dataloader import custom_cifar
 
 def get_args():
@@ -39,7 +34,6 @@ def get_args():
                         help='the coefficient used for accuracy-speed trade-off, the higher the more accurate, range from 0 to 1' )
     parser.add_argument( '--save', default=0, type=int,
                         help='whether or not to save the model. 0 or nonzero' )
-    # the following are used to cooperate with hardware control on jetson-tx2
     parser.add_argument( '--baseline', default=1, type=int,
                         help='to specify whether or not the current test is baseline (1 for true and 0 for false)' )
     parser.add_argument( '--core_num', default=2, type=int,
@@ -62,6 +56,10 @@ def get_args():
                         help='the exit type we choose for Vgg19' )
     parser.add_argument('--quantization', default=0, type=int, 
                         help='the mode we choose during inference, whether normal or quantization' )
+    parser.add_argument('--forward_mode', default='normal_forward', type=str, 
+                        help='the mode we choose during inference, whether normal or accuracy' )
+    parser.add_argument('--start_layer', default=6, type=int, 
+                        help='the start layer that we set' )
     args = parser.parse_args()
     args.torch_device = torch.device( 'cpu' ) if args.device == 'cpu' else torch.device( 'cuda' )
     return args
@@ -74,7 +72,7 @@ if __name__ == '__main__':
     else:
         print( f"{args.scene}_{str(args.core_num)}_{args.cpu_freq_level}_{args.gpu_freq_level}_{'Y' if args.evaluate_mode=='exits' else 'N'}" )
     if args.task == 'evaluate':
-        inference( args,  0)
+        inference( args,  args.start_layer)
     elif args.task == 'train':
         train( args )
     else:
@@ -82,32 +80,3 @@ if __name__ == '__main__':
         raise NotImplementedError
     
 
-
-
-'''
-some urgent test that you need to do:
-1.  make sure whether the average activation is taken over the classification outputs or
-    the codebook outputs···
-
-probable directions for future improvements:
-1.  test whether average activations for correct early-exits are higher than noncorrect early-exits?
-2.  test whether average activations for different labels are different?
-3.  test whether average activations have a limit when the model converges
-
-1.  train_new 讲函数改成通用化 ☑️
-2.  global param 把 exit layers 改成 non-exit layers ☑️
-3.  models_new 写一下 vgg，并开始尝试训练
-4.  写一下 inference
-
-to add a new model:
-1.  add new model in model_new.py
-2.  add hyper, init, as well as normal_layer_names in global_param.py
-3.  (possibly) modify the train_exit function to balance the exit layers from different stages
-
-to adjust the early-exit layer structures:
-1.  modify the model structures in model_new.py
-
-
-todo: 
-1. test whether the 'easy' images are consistently easy among testbenches with different initialization
-'''

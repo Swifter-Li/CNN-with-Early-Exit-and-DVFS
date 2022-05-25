@@ -2,11 +2,6 @@
 DESCRIPTION:    this file contains the codes needed to create new datasets that store easy
                 and difficult images, respectively.
 
-AUTHOR:         Lou Chenfei  Li Xiangjie
-
-INSTITUTE:      Shanghai Jiao Tong University, UM-SJTU Joint Institute
-
-PROJECT:        ECE4730J Advanced Embedded System Capstone Project
 """
 
 import pandas as pd
@@ -15,10 +10,10 @@ import torch
 
 import global_param as gp
 import utils_new as utils
-import models_new
-from models_new import get_eval_model
+import models_1
+from models_1 import get_eval_model
 import global_param as gp
-from train_new import test_exits
+from train import test_exits
 
 class custom_cifar( Dataset ):
     '''

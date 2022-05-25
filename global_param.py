@@ -406,7 +406,7 @@ vgg19_normal_train_hyper = utils.Namespace(
 )
  
 vgg19_original_train_hyper = utils.Namespace(
-    epoch_num = 100,
+    epoch_num = 1,
     learning_rate = 0.00025,
     batch_size = 128,
     transform = transforms.Compose([
@@ -416,7 +416,7 @@ vgg19_original_train_hyper = utils.Namespace(
 )
 
 vgg19_exits_train_hyper = utils.Namespace(
-    epoch_num = 100,
+    epoch_num = 1,
     learning_rate = 0.001,
     batch_size = 128,
     transform = transforms.Compose([
