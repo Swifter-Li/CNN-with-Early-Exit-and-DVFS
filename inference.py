@@ -22,9 +22,6 @@ from global_param import cifar10_computataional_cost, resnet_computataional_cost
 from models_3 import total_round
 from tutorial import evaluate
 import os
-import pandas as pd
-import matplotlib
-import matplotlib.pyplot as plt
 def get_inference_model( args ):
     '''
     get the model for inference from the pretrained model

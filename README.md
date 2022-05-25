@@ -9,6 +9,8 @@ Exits for Computation- and Energy-Efficient
 Inference</h2>
 
 ---
+### Required Packages
+torch, torchvision, argparse, numpy.
 
 ### File Description
 
