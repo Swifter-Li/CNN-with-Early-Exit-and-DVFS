@@ -1,36 +1,12 @@
 ---
-
+header-includes:
+  - \usepackage[ruled,vlined,linesnumbered]{algorithm2e}
 ---
 
 ---
 <h2 align="center">Predictive Exit: Prediction of Fine-Grained Early
 Exits for Computation- and Energy-Efficient
 Inference</h2>
-
-<h5 align="center"> UM-SJTU Joint Institute </h5>
-
-<h5 align="center"> Electrical and Computer Engineering </h5>
-
----
-
-<table align="center" width="100%">
-  <thead align="center">
-    <tr align="center">
-      <th colspan="7" align="center"> Authors </th>
-    </tr>
-  </thead>
-  <tbody>
-		<tr>
-            <td align="center"> 李向杰 </td>
-            <td align="center"> 邹桉 </td>
-            <td align="center"> 马叶涵 </td>
-			<td align="center"> 娄辰飞 </td>
-            <td align="center"> 朱正平 </td>
-            <td align="center"> 陈禹池 </td>
-            <td align="center"> 沈颖涛 </td>
-		</tr>
-  </tbody>
-</table>
 
 ---
 
@@ -41,25 +17,20 @@ Inference</h2>
     the data structure of BoF (Bag-of-Features) pooling
 - `global_param.py`  
   network initializations, the training and evaluation hyperparameters, the hardware configurations and so on
-- `inference_new.py`  
+- `inference.py`  
   inference of trained neural networks
 - `main_new.py`  
   the main program
-- `models_new.py`  
+- `models_1.py`  
   the different types of neural network models including vgg19 for cifar10, cifar100
-- `models_new_2.py`  
+- `models_2.py`  
   the different types of neural network models including vgg19 for stl10, svhn
-- `models_new_3.py`  
+- `models_3.py`  
   the different types of neural network models including Resnet-34
-- `train_new.py`  
+- `train.py`  
   training of neural networks
 - `utils_new.py`  
   some general functions
-- `power_management_api/`  
-    - `api.py`  
-    the APIs that deal with hardwares in the embedded board Jetson TX2
-    - `README.md`  
-    the detailed introductions for api functions
 - `create_custom_dataloader`  
   the functions to create customized dataloaders
 - `generate_scripts.py`  
@@ -81,8 +52,7 @@ Their meanings are specified as below. Note that not all arguments are meaningfu
     - '[model_name]_exits_default.pt' means the model with early-exit layers implemented and well trained.
 - `OPTIM_NAME`: the name of the optimizer. Either 'sgd' or 'adam'. Usually by using 'adam' the training can be much more efficient.
 - `TRAIN_MODE`: the mode for training. 
-    - 'normal': train the model according to the most vanilla setting ---- without any early-exit schemes
-    - 'original': train the model with early-exit layers implemented but only train the original layers and ignore the early-exit layers. This mode stores a pre-trained file that is necessary for the following 'exits' mode
+    - 'original': train the model with early-exit layers implemented but only train the original layers and ignore the early-exit layers. This mode stores a pre-trained file that is necessary for the following 'exits' mode. This type can also be treated as a normal model without any exit layer. 
     - 'exits': train the early-exit layers of the model, assuming that the original layers have already been trained.
 - `STAT`: whether to collect the statistics of each layer, 1 for True and 0 for False
 - `EVALUATE_MODE`: the mode for evaluation.
@@ -101,10 +71,10 @@ Their meanings are specified as below. Note that not all arguments are meaningfu
 
 #### Changing the Experimental Setting
 
-we can change the setting of hyperparameters by making corresponding changes in `global_param.py`. For example, `cifar_normal_train_hyper` (line 233 in `global_param.py`) specifies the hyperparameter for normal training of cifar model. By changing the epoch number, batch size and so on, the hyperparameters for that task will be changed accordingly. 
+we can change the setting of hyperparameters by making corresponding changes in `global_param.py`. For example, `vgg19_original_train_hyper` (line 408 in `global_param.py`) specifies the hyperparameter for normal training of cifar model. By changing the epoch number, batch size and so on, the hyperparameters for that task will be changed accordingly. 
 
 #### Changing the Model Structure
-Unfortunately, if you want to modify the structure for a neural network model (e.g. add a layer or enlarge the layer) or define a new structure, you'll need to do that by yourself by directly modifying the file `models_new.py`. You would probably need to modify (or create) their layer name lists, their initialization and hyperparameter dictionaries in `global_param.py` accordingly. That would be somewhat frustrating, so be prepared.
+Unfortunately, if you want to modify the structure for a neural network model (e.g. add a layer or enlarge the layer) or define a new structure, you'll need to do that by yourself by directly modifying the file `models.py`. You would probably need to modify (or create) their layer name lists, their initialization and hyperparameter dictionaries in `global_param.py` accordingly. That would be somewhat frustrating, so be prepared.
 
 ### Examples
 
@@ -116,15 +86,24 @@ The first thing you'll need to do is to train a network. Say you want to train t
 python3 main_new.py --model_name vgg19 --optimizer adam --train_mode original --task train --device cuda --trained_file_suffix cifar10 --save 1 --dataset_type cifar10 --jump 1
 ```
 
-After that, you're gonna fix all the normal layers and start training the early exit layers by executing the command:
+After that, you can start training the early exit layers by executing the command:
 ```shell
 python3 main_new.py --model_name vgg19 --optimizer adam --train_mode exits --task train --device cuda --pretrained_file autodl-tmp/vgg19_train_original_cifar10.pt --trained_file_suffix cifar10 --save 1 --dataset_type cifar10 --jump 1
 ```
 
-Now basically you've done the training, and the trained model would be stored in `models_new/vgg19_train_exits_cifar10.pt`. And from the command output, you'll be able to see the accuracy after the training. If you are not satisfied with the accuracy, you could modify the model structures or hyperparameters and then do the above steps again.
+Now basically you've done the training, and the trained model would be stored in `autodl-tmp/vgg19_train_exits_cifar10.pt`. And from the command output, you'll be able to see the accuracy after the training. If you are not satisfied with the accuracy, you could modify the model structures or hyperparameters and then do the above steps again. 
 
 #### Inferences
-After training the model, you may want to test the early exit results by doing some inferences with different values of the parameter `beta`. If you want to do that on computers / servers, you will need to modify the codes in `inference_new.py` by removing all the commands regarding hardwares. Then the command you're gonna type in the shell would be like:
+After training the model, you may want to test the early exit results by doing some inferences with different values of the parameter `beta`.  There are two set of forward mode and `start_layer` that you need to input:
+
+`normal_forward`: Run the inference with prediction engine
+
+`accuracy_forward`: Test the accuracy of the prediction engine
+
+`start_layer`: Choose the $L_0$
+
+Then the command you're gonna type in the shell would be like:
+
 ```shell
 python3 main_new.py --model_name vgg19 --optimizer adam --train_mode exits --task evaluate --device cuda --pretrained_file autodl-tmp/vgg19_train_exits_cifar10.pt  --beta 15 --save 0 --dataset_type cifar10 --evaluate_mode exits --jump 1 --quantization 0 --forward_mode normal_forward --start_layer 8
 ```

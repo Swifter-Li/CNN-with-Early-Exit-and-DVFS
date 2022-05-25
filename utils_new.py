@@ -1,11 +1,6 @@
 """
 DESCRIPTION:    this file contains general utilities that are used in this project
 
-AUTHOR:         Lou Chenfei  Li Xiangjie
-
-INSTITUTE:      Shanghai Jiao Tong University, UM-SJTU Joint Institute
-
-PROJECT:        ECE4730J Advanced Embedded System Capstone Project
 """
 
 import torch
@@ -19,6 +14,7 @@ class Namespace():
 
 def calculate_average_activations( param:torch.Tensor ):
     assert len( param.shape ) == 2
+    #A = torch.abs(param)
     return param.sum().item() / param.numel()
 
 def create_model_file_name( args ):
