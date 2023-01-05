@@ -4,8 +4,7 @@ header-includes:
 ---
 
 ---
-<h2 align="center">Predictive Exit: Prediction of Fine-Grained Early
-Exits for Computation- and Energy-Efficient
+<h2 align="center">Project for predictve exit
 Inference</h2>
 
 ---
